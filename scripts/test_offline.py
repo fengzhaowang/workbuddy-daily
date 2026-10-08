@@ -178,6 +178,30 @@ def main() -> int:
                     len(jia2) == 1 and any("乙" in b for b in ding2),
                     str([len(jia2), [b[:40] for b in ding2]]))
         os.environ.pop("NOTIFY_CHANNELS", None)
+
+        print("⑥ 静默忽略检查 + 「没配渠道」要说清是谁")
+        # 6.1 清单里有本版代码不认识的字段，必须被点名。
+        #     这次的线上事故就是「清单比代码新」-> notify 被旧代码静默吞掉，
+        #     人只看到「我明明配了怎么没生效」。这条断言守住它。
+        future = daily._to_account(
+            {"name": "戊", "token": "t5", "uid": "u5", "notifyFromFuture": {"x": 1}}, 1, base)
+        ok &= check("清单里的未知字段被识别出来（不再静默忽略）",
+                    future.unknown == ["notifyFromFuture"], json.dumps(future.unknown))
+        known = daily._to_account(
+            {"name": "己", "token": "t6", "uid": "u6", "notify": ["dingtalk"],
+             "added_at": 1, "expires_at": 2, "domain": "d", "feishu_webhook": "https://x"}, 1, base)
+        ok &= check("已知字段 / 本机元数据不误报", known.unknown == [], json.dumps(known.unknown))
+
+        # 6.2 谁都没配 notify、全局也没渠道 -> 提示里必须点名是哪几个人
+        os.environ.pop("DINGTALK_WEBHOOK", None)
+        os.environ.pop("SERVERCHAN_KEY", None)
+        plain = daily._parse_accounts({"accounts": [
+            {"name": "庚", "token": "t7", "uid": "u7", "endpoint": base},
+            {"name": "辛", "token": "t8", "uid": "u8", "endpoint": base}]}, base)
+        n2 = daily.notify([daily.run_one(a) for a in plain], "2026-01-01 00:00", "test")
+        msg = next((n for n in n2 if "未配置任何推送渠道" in n), "")
+        ok &= check("提示点名了受影响的账号（庚、辛）且给了下一步",
+                    "庚" in msg and "辛" in msg and "--push" in msg and "提交" in msg, msg)
     finally:
         srv.shutdown()
 

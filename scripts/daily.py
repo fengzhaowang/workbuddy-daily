@@ -166,6 +166,16 @@ _FIELD_ALIASES = {
     "notify": ("notify", "channels", "push", "通知", "通知渠道"),
 }
 
+# 本机清单里的元数据字段：只在本地存在，不会进 secret，本地跑也不该报「不认识」
+_LOCAL_META_KEYS = {"added_at", "expires_at", "expires_in", "note", "remark", "说明"}
+
+# 本版代码认识的字段全集。用来做「静默忽略」检查（见 _to_account 的 unknown）。
+_KNOWN_KEYS = frozenset(
+    {alias for aliases in _FIELD_ALIASES.values() for alias in aliases}
+    | {"webhook", "feishu_webhook", "secret", "feishu_secret"}   # 旧写法，等价 notify.feishu
+    | _LOCAL_META_KEYS
+)
+
 
 @dataclass
 class Account:
@@ -177,6 +187,10 @@ class Account:
     # {渠道: {字段: 值}}；空 dict 表示该渠道「借全局 secret」。
     # 整个为空 = 这个人的结果并入汇总卡片。
     notify: dict = field(default_factory=dict)
+    # 清单里写了、但本版代码不认识的字段。
+    # 非致命，但**必须**报出来：否则「清单升了级、云端跑的还是旧代码」会让配置
+    # 被静默忽略，人只看到「我明明配了怎么没生效」。这个字段就是为那次事故加的。
+    unknown: list = field(default_factory=list)
 
 
 def _pick(raw: dict, key: str) -> str:
@@ -193,6 +207,10 @@ def _to_account(raw: Any, index: int, endpoint_env: str) -> Account:
     token = _pick(raw, "token")
     if not token:
         raise ValueError("账号清单第 %d 项缺少 token" % index)
+    # 认不出来的字段要报出来，不能静默吞掉：可能是拼错，也可能是「清单比代码新」
+    # （云端跑的 commit 太旧，新字段被这版代码忽略——正是这一条能提前暴露它）。
+    unknown = sorted(str(k) for k in raw
+                     if not str(k).startswith("_") and k not in _KNOWN_KEYS)
     return Account(
         name=_pick(raw, "name") or "账号%d" % index,
         token=token,
@@ -200,6 +218,7 @@ def _to_account(raw: Any, index: int, endpoint_env: str) -> Account:
         domain=_pick(raw, "domain"),
         endpoint=_pick(raw, "endpoint") or endpoint_env,
         notify=_parse_notify(raw),
+        unknown=unknown,
     )
 
 
@@ -1234,7 +1253,13 @@ def notify(results: list[dict], stamp: str, env: str) -> list[str]:
     if shared:
         channels = detect_channels()
         if not channels:
-            notices.append("未配置任何推送渠道，已跳过（见 README「通知渠道」一节）")
+            who = "、".join(r["name"] for r in shared)
+            notices.append(
+                "未配置任何推送渠道，已跳过：%s 这 %d 个账号没在自己的条目里配 notify，"
+                "全局也没配任何渠道 secret。"
+                "（若他们其实配过自己的渠道 → 多半是云端清单/代码是旧的："
+                "重新 export_token.py --push，并确认 Actions 跑的是最新提交。"
+                "详见 README「通知渠道」一节）" % (who, len(shared)))
         else:
             secs = _sections_of(shared)
             ok = all(r["checkin_ok"] for r in shared)
@@ -1297,6 +1322,17 @@ def main() -> int:
         for p in problems:
             print("    ⚠️ %s" % p, file=sys.stderr)
 
+    # 清单里有本版代码不认识的字段 -> 大声报出来（否则就是「配了却不生效」）
+    unknown_warnings = [
+        "%s：清单条目里有本版代码不认识的字段 %s，它们会被静默忽略。"
+        "最常见的原因是「清单已升级、跑的代码还是旧的」——"
+        "push 最新代码后重跑；若是拼错字段名，改掉即可。"
+        % (a.name, "、".join(a.unknown))
+        for a in accounts if a.unknown
+    ]
+    for w in unknown_warnings:
+        print("  ⚠️ %s" % w, file=sys.stderr)
+
     results: list[dict] = []
     for a in accounts:
         if _budget_left() <= 1:
@@ -1340,6 +1376,11 @@ def main() -> int:
         body["notices"] = ["(--no-notify：已跳过推送)"]
     else:
         body["notices"] = notify(results, stamp, env_name)
+
+    # 「配置被静默忽略」是最难自查的一类问题：放到最显眼的两处，别让人去翻日志
+    if unknown_warnings:
+        body["warnings"] = unknown_warnings
+        body["notices"] = unknown_warnings + body["notices"]
 
     print(json.dumps(body, ensure_ascii=False, indent=2))
 
