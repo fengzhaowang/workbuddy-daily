@@ -1,0 +1,41 @@
+name: Buddy 加油站每日任务
+
+# 每天定时跑一次，一次把「签到」和「派猫猫旅行」都做掉。
+# cron 用 UTC：下面这行 = 北京时间每天 00:20 执行。
+# 想改时间就改 cron，注意换算：北京时间 = UTC + 8。
+on:
+  schedule:
+    - cron: "20 16 * * *"
+  workflow_dispatch: {}      # 也可以到 Actions 页面手动点一次
+
+permissions:
+  contents: read
+
+# 防止上一次还没跑完又起一次，导致重复提交
+concurrency:
+  group: buddy-daily
+  cancel-in-progress: false
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 签到 + 派猫猫，并推送飞书
+        env:
+          # 凭证由本机刷新脚本 scripts/export_token.py 注入仓库 secret
+          WB_TOKEN: ${{ secrets.WB_TOKEN }}
+          WB_UID: ${{ secrets.WB_UID }}
+          WB_DOMAIN: ${{ secrets.WB_DOMAIN }}
+          # 飞书自定义机器人：Webhook 必填；开了签名校验才需要 FEISHU_SECRET
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+          WB_ENV: prod
+        run: |
+          set -euo pipefail
+          # 解释器路径不写死版本号，动态取当前 runner 上的 python3
+          PYTHON_BIN="$(command -v python3)"
+          echo "python: ${PYTHON_BIN} ($("${PYTHON_BIN}" -V 2>&1))"
+          "${PYTHON_BIN}" scripts/daily.py

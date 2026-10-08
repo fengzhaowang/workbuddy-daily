@@ -1,0 +1,19 @@
+# 运行产物
+result.json
+raw_dump.json
+*.log
+
+# 本机登录态 / 凭证：任何情况下都不许进仓库
+auth/
+*.info
+.credentials*
+.env
+.env.*
+
+# 调试用临时目录
+wb-probe/
+__pycache__/
+*.pyc
+
+# 系统
+.DS_Store
