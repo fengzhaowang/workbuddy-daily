@@ -35,6 +35,10 @@ Actions 里就一定能通——避免「自检能过、线上不发」这种最
   # 只想看会发出去什么内容，不发
   python3 scripts/test_notify.py --channel dingtalk --print
 
+  # 体检真实账号清单的路由：谁发给谁、凭据取自哪里（不发消息、不打印凭证）
+  python3 scripts/test_notify.py --plan --from accounts.local.json
+  python3 scripts/test_notify.py --plan                 # 或读环境变量 WB_ACCOUNTS
+
 注意：会真的发出一条通知消息（这就是目的）。密钥在输出里做过打码。"""
 
 from __future__ import annotations
@@ -53,19 +57,6 @@ import daily  # noqa: E402
 
 SAMPLE_CHECKIN = "✅ 今日已签过（今日 100，连续 3 天，累计 300）"
 SAMPLE_CAT = ["🐾 猫咪：龙焰喵（SSR）", "🐱 猫猫旅行中：咖啡馆，约 6 分钟后回"]
-
-# 每个渠道：需要哪些环境变量（用来判断「配好了没」）
-CHANNEL_ENV = {
-    "feishu": ["FEISHU_WEBHOOK"],
-    "wecom": ["WECOM_WEBHOOK"],
-    "dingtalk": ["DINGTALK_WEBHOOK"],
-    "serverchan": ["SERVERCHAN_KEY"],
-    "pushplus": ["PUSHPLUS_TOKEN"],
-    "bark": ["BARK_KEY"],
-    "ntfy": ["NTFY_TOPIC"],
-    "telegram": ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"],
-    "email": ["SMTP_HOST", "SMTP_USER", "SMTP_PASS"],
-}
 
 # 该渠道怎么拿凭据、怎么配安全设置
 HOWTO = {
@@ -116,10 +107,78 @@ HINTS = {
 
 
 def configured(ch: str) -> tuple[bool, str]:
-    missing = [k for k in CHANNEL_ENV.get(ch, []) if not (os.environ.get(k) or "").strip()]
-    if missing:
-        return False, "缺 %s" % " / ".join(missing)
+    """该渠道的全局 secret 配全了没。
+
+    直接问 daily 的渠道规格表（唯一真相），所以这里的判断和线上完全一致，
+    不会出现「自检说配好了、线上却跳过」。
+    """
+    cfg = daily._env_cfg(ch)
+    miss = daily._missing_fields(ch, cfg)
+    if miss:
+        names = " / ".join(
+            n for f, ns in daily.CHANNEL_SPEC[ch]["env"].items() if f in miss
+            for n in ((ns,) if isinstance(ns, str) else ns))
+        return False, "缺 %s（%s）" % ("、".join(miss), names)
     return True, ""
+
+
+def plan(accounts_path: str | None) -> int:
+    """体检真实清单的路由：谁发给谁、凭据取自哪里。不发消息、不打印凭证。"""
+    try:
+        if accounts_path:
+            with open(accounts_path, encoding="utf-8") as fp:
+                raw = json.load(fp)
+            source = accounts_path
+        else:
+            env_json = (os.environ.get("WB_ACCOUNTS") or "").strip()
+            if not env_json:
+                print("❌ --plan 需要账号清单：给 --from <文件>，或设好 WB_ACCOUNTS。",
+                      file=sys.stderr)
+                return 2
+            raw = json.loads(env_json)
+            source = "环境变量 WB_ACCOUNTS"
+        accounts = daily._parse_accounts(raw, os.environ.get("WB_ENDPOINT") or daily.ENDPOINT_DEFAULT)
+    except Exception as e:  # noqa: BLE001
+        print("❌ 读取账号清单失败：%s" % e, file=sys.stderr)
+        return 2
+
+    global_chans = daily.detect_channels()
+    spec = (os.environ.get("NOTIFY_CHANNELS") or "").strip()
+
+    print("=" * 66)
+    print("通知路由预览（只看不发）")
+    print("来源：%s   共 %d 个账号" % (source, len(accounts)))
+    print("=" * 66)
+    shared = []
+    for i, a in enumerate(accounts, 1):
+        resolved, problems = daily.account_channels(a)
+        if not a.notify:
+            shared.append(a.name)
+            where = "汇总卡片"
+        elif resolved:
+            where = "、".join(
+                "%s（%s）" % (daily.CHANNEL_LABEL[ch], "自带" if a.notify.get(ch) else "借全局")
+                for ch in resolved)
+        else:
+            where = "⚠️ 没配全，这条不会发出去"
+        print("  %d. %-14s → %s" % (i, a.name, where))
+        for p in problems:
+            print("       ⚠️ %s" % p)
+
+    print()
+    print("全局渠道（NOTIFY_CHANNELS %s）：%s"
+          % ("点名为 %s" % spec if spec else "未点名",
+             "、".join(daily.CHANNEL_LABEL[c] for c in global_chans) or "（一个都没配）"))
+    if shared and not global_chans:
+        print("  ⚠️ 有 %d 个账号要发汇总卡片，但全局一个渠道都没配 —— 他们的结果发不出去：%s"
+              % (len(shared), "、".join(shared)))
+    if not shared:
+        print("  说明：所有账号都配了自己的渠道，汇总卡片这一份不会有内容。")
+    print()
+    print("下一步：确认上面无误后，按渠道跑一次真实自检（会真的发一条）：")
+    print("  python3 scripts/test_notify.py --channel %s"
+          % (global_chans[0] if global_chans else "serverchan"))
+    return 0
 
 
 def resolve_channels(spec: str) -> list[str]:
@@ -235,12 +294,20 @@ def main() -> int:
     ap.add_argument("--mail-to", dest="mail_to")
     ap.add_argument("--accounts", type=int, default=2,
                     help="预览几个账号的内容（默认 2；填 1 可看单账号样式）")
+    ap.add_argument("--plan", action="store_true",
+                    help="只体检真实清单的通知路由（谁发给谁），不发消息、不打印凭证")
+    ap.add_argument("--from", dest="from_file", metavar="FILE",
+                    help="配合 --plan：账号清单 JSON 文件；不给则读环境变量 WB_ACCOUNTS")
     ap.add_argument("--print", dest="just_print", action="store_true",
                     help="只打印会发出去的内容，不真的发")
     args = ap.parse_args()
 
     # 先把命令行参数落到环境变量，再据此判断「哪些渠道配好了」
     apply_cli(args)
+
+    if args.plan:
+        return plan(args.from_file)
+
     channels = resolve_channels(args.channel)
 
     unknown = [c for c in channels if c not in daily.NOTIFY_ORDER]
@@ -287,7 +354,7 @@ def main() -> int:
             continue
 
         before = len(daily.LAST_TRACE)
-        result = daily._dispatch(ch, stamp, "test", title, sections, True)
+        result = daily._dispatch(ch, daily._env_cfg(ch), stamp, "test", title, sections, True)
         trace = (daily.LAST_TRACE[before:] or [None])[-1]
 
         print("   发送：%s" % result)

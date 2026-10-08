@@ -36,6 +36,10 @@ jobs:
         env:
           # 多账号清单：JSON 数组，由本机刷新脚本注入（推荐）
           # [{"name":"我的账号","token":"...","uid":"...","domain":"www.workbuddy.cn"}]
+          # 某个账号想只收自己的通知（不并进汇总卡片），在它的条目上加 notify，例如
+          #   "notify": ["dingtalk"]                                  借全局 secret
+          #   "notify": {"wecom": "https://qyapi.weixin.qq.com/..."}  用自己的机器人
+          # 所以「谁发给谁」跟着这个 secret 走；改完要重新 --push 一次。
           WB_ACCOUNTS: ${{ secrets.WB_ACCOUNTS }}
           # 旧版单账号 secret，仍兼容；配了 WB_ACCOUNTS 时以清单为准
           WB_TOKEN: ${{ secrets.WB_TOKEN }}
@@ -48,8 +52,10 @@ jobs:
           # 变成「至少一个账号签到成功即算成功」。
           # WB_ALLOW_PARTIAL: "1"
 
-          # ============ 通知渠道 ============
+          # ============ 通知渠道（全局层）============
           # 下面的渠道「配了哪个就发哪个」。全都不配也不会报错，只是不发通知。
+          # 它们服务于：① 没配 notify 的账号的汇总卡片；② notify 里只写渠道名、想借全局凭据的人。
+          # 各人自带的凭据写在 WB_ACCOUNTS 的 notify 里，不需要在这里建 secret。
           # 配了多个会各发一份；只想发其中几个就点名，例如：
           #   NOTIFY_CHANNELS: dingtalk,serverchan
           #   NOTIFY_CHANNELS: all          # 所有已配置的渠道

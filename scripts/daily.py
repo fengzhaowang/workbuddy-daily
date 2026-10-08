@@ -6,15 +6,19 @@
   2. 猫猫旅行：先领掉「已到家」那一趟的旅行积分，再判断今天还能不能派新的一趟；
      今天已经派过（daily_limit_reached）就不派。
 
-结果推送：默认把没有专属 webhook 的账号汇总成**一份**，每个账号一个分区、
-区内「🏠 签到」与「🐾 猫猫」分行写清；某个账号如果自带 webhook，
-则单独发给他自己的群。
+结果推送分两层，**可以逐人定制**：
+
+  * **每个人自己的渠道**：账号清单里给某个账号写 `notify`，他的那一份就只发到
+    他自己指定的渠道（可以多个），不混进汇总卡片。
+    凭据可以自带（他自己的机器人/邮箱/微信推送），也可以只写渠道名去借全局 secret。
+  * **没人认领的账号**：汇总成**一份**，每个账号一个分区、区内「🏠 签到」与
+    「🐾 猫猫」分行写清，再发到全局配置的渠道。
 
 通知渠道可插拔，支持 9 种，**配了哪个就发哪个**（配几个发几个）：
   飞书 / 企业微信 / 钉钉 / Server酱 / PushPlus / Bark / ntfy / Telegram / 邮件
-用 NOTIFY_CHANNELS 点名可以只发其中几个（例：NOTIFY_CHANNELS=dingtalk,email）。
-一个渠道都没配不会报错，只是在结果里提示一句。某个渠道失败只写进 notices，
-既不影响退出码，也不影响别的渠道。
+用 NOTIFY_CHANNELS 点名可以只发其中几个（例：NOTIFY_CHANNELS=dingtalk,email），
+它只管「全局那一层」。一个渠道都没配不会报错，只是在结果里提示一句。
+某个渠道失败只写进 notices，既不影响退出码，也不影响别的渠道。
 
 隔离层级（重要）：
   * 账号之间互相隔离——A 的 token 过期不影响 B 照常签到；
@@ -30,12 +34,14 @@
   4. WB_TOKEN / WB_UID        旧版单账号环境变量（向后兼容）
 
 明文 token 只从上述来源读入，不打印、不落盘；所有输出经脱敏。
+注意：账号自带的渠道凭据写在清单里（= WB_ACCOUNTS 这个 secret 内），
+所以它跟 token 一样不能进仓库、不进日志；报错信息里只报「缺哪个字段」。
 
 用法：
   python3 scripts/daily.py                          # 云端：读 WB_ACCOUNTS
   python3 scripts/daily.py --local                  # 本机单账号
   python3 scripts/daily.py --accounts accounts.local.json   # 本机多账号
-  python3 scripts/daily.py --list-accounts          # 只列出识别到的账号（脱敏）
+  python3 scripts/daily.py --list-accounts          # 只列出识别到的账号（脱敏 + 渠道）
   python3 scripts/daily.py --only "我的账号,小号"    # 只跑指定账号（名字或序号）
   python3 scripts/daily.py --local --raw            # 附上脱敏后的原始返回
   python3 scripts/daily.py --dry-run                # 只查状态，不做写操作
@@ -150,14 +156,14 @@ def is_ok(code: int, body: Any) -> bool:
 
 # ================= 账号清单 =================
 # 兼容多种字段写法，尽量让人少踩坑：token/access_token、uid/user_id……
+# notify 的细节（渠道名、字段别名）在下面「推送」一节，那里与渠道规格表放在一起。
 _FIELD_ALIASES = {
     "name": ("name", "alias", "label", "账号", "备注"),
     "token": ("token", "access_token", "accessToken", "wb_token"),
     "uid": ("uid", "user_id", "userId", "wb_uid"),
     "domain": ("domain", "wb_domain"),
     "endpoint": ("endpoint", "base_url", "baseUrl"),
-    "webhook": ("webhook", "feishu_webhook", "feishuWebhook"),
-    "secret": ("secret", "feishu_secret", "feishuSecret"),
+    "notify": ("notify", "channels", "push", "通知", "通知渠道"),
 }
 
 
@@ -168,8 +174,9 @@ class Account:
     uid: str = ""
     domain: str = ""
     endpoint: str = ENDPOINT_DEFAULT
-    webhook: str = ""      # 该账号专属飞书机器人（留空则并入汇总卡片）
-    secret: str = ""       # 专属机器人开了签名校验时才需要
+    # {渠道: {字段: 值}}；空 dict 表示该渠道「借全局 secret」。
+    # 整个为空 = 这个人的结果并入汇总卡片。
+    notify: dict = field(default_factory=dict)
 
 
 def _pick(raw: dict, key: str) -> str:
@@ -192,8 +199,7 @@ def _to_account(raw: Any, index: int, endpoint_env: str) -> Account:
         uid=_pick(raw, "uid"),
         domain=_pick(raw, "domain"),
         endpoint=_pick(raw, "endpoint") or endpoint_env,
-        webhook=_pick(raw, "webhook"),
-        secret=_pick(raw, "secret"),
+        notify=_parse_notify(raw),
     )
 
 
@@ -256,11 +262,13 @@ def _select(accounts: list[Account], spec: str) -> list[Account]:
 
 
 def public_account(a: Account) -> dict:
-    """给日志/JSON 用的脱敏视图。"""
+    """给日志/JSON 用的脱敏视图（只报渠道名，绝不报凭据）。"""
+    chans, problems = account_channels(a)
     out = {"name": a.name, "uid": redact(a.uid), "token": redact(a.token),
-           "domain": a.domain or "-", "endpoint": a.endpoint}
-    if a.webhook:
-        out["webhook"] = "专属（已配置）"
+           "domain": a.domain or "-", "endpoint": a.endpoint,
+           "channels": "、".join(CHANNEL_LABEL.get(c, c) for c in chans) or "汇总卡片"}
+    if problems:
+        out["channel_problems"] = problems
     return out
 
 
@@ -616,14 +624,238 @@ NOTE_TEXT = "各账号互相隔离 · 猫猫段失败不影响该账号签到结
 # 支持的推送渠道。没配 NOTIFY_CHANNELS 时按这个顺序自动探测：
 # 哪个渠道的 secret 配了，就发哪个；配了几个就发几个。
 # 不想全发就用 NOTIFY_CHANNELS 点名，例：NOTIFY_CHANNELS=dingtalk,email
-NOTIFY_ORDER = ("feishu", "wecom", "dingtalk", "serverchan", "pushplus",
-                "bark", "ntfy", "telegram", "email")
-
-CHANNEL_LABEL = {
-    "feishu": "飞书", "wecom": "企业微信", "dingtalk": "钉钉",
-    "serverchan": "Server酱", "pushplus": "PushPlus", "bark": "Bark",
-    "ntfy": "ntfy", "telegram": "Telegram", "email": "邮件",
+#
+# 渠道规格表是「一份真相」：全局 secret 与每个账号自带的 notify 共用它，
+# 所以加渠道 / 改字段名只动这张表，两条路径不会走偏。
+#   fields  : 该渠道认的字段
+#   require : 少一个就算没配好（缺了会明确报出来，而不是静默不发）
+#   primary : 配置写成一个字符串时，这个值落到哪个字段
+#   env     : 字段对应的全局 secret 名（可以是名字元组，按序取第一个非空的）
+CHANNEL_SPEC: dict[str, dict] = {
+    "feishu": {"label": "飞书", "fields": ("webhook", "secret"), "require": ("webhook",),
+               "primary": "webhook",
+               "env": {"webhook": "FEISHU_WEBHOOK", "secret": "FEISHU_SECRET"}},
+    "wecom": {"label": "企业微信", "fields": ("webhook",), "require": ("webhook",),
+              "primary": "webhook", "env": {"webhook": "WECOM_WEBHOOK"}},
+    "dingtalk": {"label": "钉钉", "fields": ("webhook", "secret"), "require": ("webhook",),
+                 "primary": "webhook",
+                 "env": {"webhook": "DINGTALK_WEBHOOK", "secret": "DINGTALK_SECRET"}},
+    "serverchan": {"label": "Server酱", "fields": ("key",), "require": ("key",),
+                   "primary": "key",
+                   "env": {"key": ("SERVERCHAN_KEY", "SERVERCHAN_SENDKEY")}},
+    "pushplus": {"label": "PushPlus", "fields": ("token",), "require": ("token",),
+                 "primary": "token", "env": {"token": "PUSHPLUS_TOKEN"}},
+    "bark": {"label": "Bark", "fields": ("key", "server"), "require": ("key",),
+             "primary": "key", "env": {"key": "BARK_KEY", "server": "BARK_URL"}},
+    "ntfy": {"label": "ntfy", "fields": ("topic", "server"), "require": ("topic",),
+             "primary": "topic", "env": {"topic": "NTFY_TOPIC", "server": "NTFY_URL"}},
+    "telegram": {"label": "Telegram", "fields": ("bot_token", "chat_id"),
+                 "require": ("bot_token", "chat_id"), "primary": "bot_token",
+                 "env": {"bot_token": "TELEGRAM_BOT_TOKEN", "chat_id": "TELEGRAM_CHAT_ID"}},
+    "email": {"label": "邮件", "fields": ("host", "port", "user", "pass", "to"),
+              "require": ("host", "user", "pass"), "primary": "to",
+              "env": {"host": "SMTP_HOST", "port": "SMTP_PORT", "user": "SMTP_USER",
+                      "pass": "SMTP_PASS", "to": "MAIL_TO"}},
 }
+
+NOTIFY_ORDER = tuple(CHANNEL_SPEC.keys())
+
+CHANNEL_LABEL = {ch: s["label"] for ch, s in CHANNEL_SPEC.items()}
+
+# 字段别名：手写配置最容易在字段名上踩坑（webhook / url / hook…），尽量都兜住
+_NOTIFY_FIELD_ALIASES = {
+    "webhook": ("url", "hook", "web_hook", "feishu_webhook", "wecom_webhook"),
+    "secret": ("sign", "sign_key", "feishu_secret", "dingtalk_secret"),
+    "key": ("sendkey", "send_key", "bark_key", "serverchan_key"),
+    "token": ("pushplus_token",),
+    "bot_token": ("bottoken", "telegram_token"),
+    "chat_id": ("chatid", "chat", "telegram_chat_id"),
+    "topic": ("ntfy_topic",),
+    "server": ("base_url", "baseurl", "server_url"),
+    "host": ("smtp_host",),
+    "port": ("smtp_port",),
+    "user": ("username", "smtp_user", "sender"),
+    "pass": ("password", "smtp_pass", "auth_code"),
+    "to": ("mail_to", "mailto", "recipient"),
+}
+
+# 渠道名别名：中文、常见简写都认。写错的名字不会被静默丢掉，
+# 而是原样保留到解析结果里，由 account_channels() 明确报「不认识的渠道」。
+_CHANNEL_ALIASES = {
+    "feishu": "feishu", "lark": "feishu", "飞书": "feishu",
+    "wecom": "wecom", "weixin": "wecom", "qywx": "wecom", "企业微信": "wecom", "企微": "wecom",
+    "dingtalk": "dingtalk", "dingding": "dingtalk", "钉钉": "dingtalk",
+    "serverchan": "serverchan", "sct": "serverchan", "方糖": "serverchan",
+    "pushplus": "pushplus", "pp": "pushplus",
+    "bark": "bark",
+    "ntfy": "ntfy",
+    "telegram": "telegram", "tg": "telegram",
+    "email": "email", "mail": "email", "smtp": "email", "邮件": "email", "邮箱": "email",
+}
+
+# notify 里用来点名渠道名单的键（其余键都当成渠道名）
+_NOTIFY_WHITELIST_KEYS = ("channels", "channel", "use", "only", "list", "渠道", "启用")
+
+
+def _chan_key(name: Any) -> str:
+    """归一化渠道名。不认识的返回小写原名，让上层能报错而不是静默丢弃。"""
+    s = str(name or "").strip().lower()
+    return _CHANNEL_ALIASES.get(s, s)
+
+
+def normalize_field(ch: str, name: Any) -> str:
+    """把用户写的字段名归一化成该渠道的标准字段名；不认识返回空串。"""
+    spec = CHANNEL_SPEC.get(ch)
+    if not spec:
+        return ""
+    key = str(name or "").strip().lower()
+    for f in spec["fields"]:
+        if key == f.lower() or key in _NOTIFY_FIELD_ALIASES.get(f, ()):
+            return f
+    return ""
+
+
+def _pick_notify_fields(ch: str, raw: dict) -> dict:
+    """从一段配置里按该渠道的字段表取值（容忍别名）。空值不写入。"""
+    cfg: dict = {}
+    for k, v in raw.items():
+        field = normalize_field(ch, k)
+        if field and v not in (None, ""):
+            cfg[field] = str(v).strip()
+    return cfg
+
+
+def _env_cfg(ch: str) -> dict:
+    """全局 secret 里该渠道的配置（没配的字段不会出现）。"""
+    cfg: dict = {}
+    for field, names in CHANNEL_SPEC[ch]["env"].items():
+        for name in ((names,) if isinstance(names, str) else names):
+            v = (os.environ.get(name) or "").strip()
+            if v:
+                cfg[field] = v
+                break
+    return cfg
+
+
+def _missing_fields(ch: str, cfg: dict) -> list[str]:
+    return [f for f in CHANNEL_SPEC[ch]["require"] if not str(cfg.get(f) or "").strip()]
+
+
+def _parse_notify(raw: dict) -> dict:
+    """把账号里的通知配置归一化成 {渠道: {字段: 值}}。
+
+    空 dict 表示「这个渠道借全局 secret」。支持三种写法，可混用：
+
+      "notify": ["dingtalk"]                                  # 只选渠道，凭据用全局的
+      "notify": {"wecom": "https://...webhook..."}             # 字符串 = 该渠道的 primary 字段
+      "notify": {"channels": ["wecom","email"], "wecom": {"webhook": "...", "secret": "..."}}
+      "notify": "serverchan,email"                            # 逗号分隔的名单也行
+
+    兼容旧写法：账号上直接写 "webhook" / "secret" = 飞书专属机器人。
+    """
+    out: dict[str, dict] = {}
+    order: list[str] = []
+
+    def touch(ch: str) -> None:
+        if ch not in out:
+            out[ch] = {}
+            order.append(ch)
+
+    def is_whitelist_key(key: Any) -> bool:
+        """这个键是「渠道名单」而不是渠道名吗（channels / use / only / 渠道…）。"""
+        return (str(key).strip().lower() in _NOTIFY_WHITELIST_KEYS
+                and _chan_key(key) not in CHANNEL_SPEC)
+
+    # ① 旧写法：账号级的 webhook / secret 等价于 notify.feishu
+    legacy: dict = {}
+    for field in ("webhook", "secret"):
+        for alias in (field, "feishu_" + field):
+            v = raw.get(alias)
+            if v not in (None, ""):
+                legacy[field] = str(v).strip()
+                break
+    if legacy:
+        touch("feishu")
+        out["feishu"].update(legacy)
+
+    # ② notify 字段本身
+    val = None
+    for alias in _FIELD_ALIASES["notify"]:
+        v = raw.get(alias)
+        if v not in (None, "", [], {}):
+            val = v
+            break
+
+    if isinstance(val, str):
+        val = [x for x in re.split(r"[,;\s]+", val) if x]
+
+    whitelist: Optional[list[str]] = None
+    if isinstance(val, (list, tuple)):
+        # 名单式写法：点名的渠道全部「借全局凭据」
+        for one in val:
+            touch(_chan_key(one))
+        whitelist = list(order)
+    elif isinstance(val, dict):
+        # 先读名单（它决定渠道顺序），再读各渠道自己的配置
+        for key, v in val.items():
+            if not is_whitelist_key(key):
+                continue
+            names = v if isinstance(v, (list, tuple)) else re.split(r"[,;\s]+", str(v or ""))
+            for one in names:
+                if str(one).strip():
+                    touch(_chan_key(one))
+            whitelist = list(order)
+        for key, v in val.items():
+            if is_whitelist_key(key):
+                continue
+            ch = _chan_key(key)
+            touch(ch)
+            if ch not in CHANNEL_SPEC:
+                continue        # 写错的渠道名：留个空壳，交给 account_channels 明确报出来
+            if not v or v is True or isinstance(v, (list, tuple)):
+                continue        # 只点名 / 写空 -> 借全局 secret
+            if isinstance(v, str):
+                out[ch][CHANNEL_SPEC[ch]["primary"]] = v.strip()
+            elif isinstance(v, dict):
+                out[ch].update(_pick_notify_fields(ch, v))
+
+    if whitelist is not None:
+        # 名单就是白名单：没点到的渠道即使写了配置也不发（写空 = 回到汇总卡片）
+        out = {ch: out.get(ch, {}) for ch in whitelist}
+    return out
+
+
+def account_channels(acc: Account) -> tuple[dict, list[str]]:
+    """算出这个账号本轮发到哪几个渠道。
+
+    规则（关键差异在凭据来源）：
+      * 账号里**写了字段**的渠道 -> 只用账号自带的字段，**绝不拿全局 secret 兜底**
+        （否则会把 A 的机器人密钥发到 B 的群/邮箱，串号比不发更糟）；
+      * 只写了渠道名（配置为空）-> 借全局同名 secret。
+
+    返回 (渠道->配置, 问题列表)。渠道为空时：没声明过 -> 并入汇总卡片；
+    声明了但没配全 -> 只报问题，不重复发一份汇总（尊重「我只收自己渠道」的意图）。
+    """
+    resolved: dict[str, dict] = {}
+    problems: list[str] = []
+    for ch, own in acc.notify.items():
+        spec = CHANNEL_SPEC.get(ch)
+        if not spec:
+            problems.append("不认识的渠道「%s」，已跳过（可选：%s）"
+                            % (ch, "、".join(CHANNEL_LABEL[c] for c in NOTIFY_ORDER)))
+            continue
+        if own:
+            cfg, src = dict(own), "账号自带"
+        else:
+            cfg, src = _env_cfg(ch), "全局 secret"
+        miss = _missing_fields(ch, cfg)
+        if miss:
+            problems.append("%s：凭据来自%s，但缺 %s，本轮这条没发出去"
+                            % (spec["label"], src, "、".join(miss)))
+            continue
+        resolved[ch] = cfg
+    return resolved, problems
+
 
 
 # 每次 POST 的原始返回都记在这里，供自检脚本（scripts/test_notify.py）
@@ -882,73 +1114,51 @@ def _post_raw(url: str, data: bytes, headers: dict, label: str) -> str:
 
 
 def detect_channels() -> list[str]:
-    """决定这轮要发哪些渠道。
+    """全局那一层这轮要发哪些渠道。
 
     * 配了 NOTIFY_CHANNELS：按点名发（all = 所有已配置的渠道）；
-    * 没配：哪个渠道的 secret 配了就发哪个（配了几个发几个）。
+    * 没配：哪个渠道的 secret 配全了就发哪个（配了几个发几个）。
+
+    只关心**全局 secret**；账号自带的渠道由 account_channels() 单独算，互不影响。
     """
-    def env(k: str) -> str:
-        return (os.environ.get(k) or "").strip()
+    available = [ch for ch in NOTIFY_ORDER if not _missing_fields(ch, _env_cfg(ch))]
 
-    available = set()
-    if env("FEISHU_WEBHOOK"):
-        available.add("feishu")
-    if env("WECOM_WEBHOOK"):
-        available.add("wecom")
-    if env("DINGTALK_WEBHOOK"):
-        available.add("dingtalk")
-    if env("SERVERCHAN_KEY") or env("SERVERCHAN_SENDKEY"):
-        available.add("serverchan")
-    if env("PUSHPLUS_TOKEN"):
-        available.add("pushplus")
-    if env("BARK_KEY") or env("BARK_URL"):
-        available.add("bark")
-    if env("NTFY_TOPIC"):
-        available.add("ntfy")
-    if env("TELEGRAM_BOT_TOKEN") and env("TELEGRAM_CHAT_ID"):
-        available.add("telegram")
-    if env("SMTP_HOST"):
-        available.add("email")
-
-    spec = env("NOTIFY_CHANNELS").lower().replace(";", ",")
-    if spec:
-        want = {c.strip() for c in spec.split(",") if c.strip()}
-        if "all" in want:
-            return [c for c in NOTIFY_ORDER if c in available]
-        return [c for c in NOTIFY_ORDER if c in want and c in available]
-    return [c for c in NOTIFY_ORDER if c in available]
+    spec = (os.environ.get("NOTIFY_CHANNELS") or "").strip().lower().replace(";", ",")
+    if not spec:
+        return available
+    want = {_chan_key(c) for c in spec.split(",") if c.strip()}
+    if "all" in want:
+        return available
+    return [ch for ch in available if ch in want]
 
 
-def _dispatch(ch: str, stamp: str, env: str, title: str,
+def _dispatch(ch: str, cfg: dict, stamp: str, env: str, title: str,
               sections: list[dict], ok: bool) -> str:
-    """把一份内容投给某个渠道。单个渠道炸了不影响其他渠道。"""
-    def e(k: str) -> str:
-        return (os.environ.get(k) or "").strip()
+    """把一份内容投给某个渠道；配置由调用方给（全局的，或某个账号自带的）。
 
+    单个渠道炸了只返回一句失败原因，不影响其他渠道、也不影响退出码。
+    """
     try:
         if ch == "feishu":
-            return push_feishu(e("FEISHU_WEBHOOK"), stamp, env, sections, ok,
-                               os.environ.get("FEISHU_SECRET", ""))
+            return push_feishu(cfg["webhook"], stamp, env, sections, ok,
+                               cfg.get("secret") or "")
         if ch == "wecom":
-            return push_wecom(e("WECOM_WEBHOOK"), sections, title)
+            return push_wecom(cfg["webhook"], sections, title)
         if ch == "dingtalk":
-            return push_dingtalk(e("DINGTALK_WEBHOOK"), sections, title, e("DINGTALK_SECRET"))
+            return push_dingtalk(cfg["webhook"], sections, title, cfg.get("secret") or "")
         if ch == "serverchan":
-            return push_serverchan(e("SERVERCHAN_KEY") or e("SERVERCHAN_SENDKEY"),
-                                   title, sections)
+            return push_serverchan(cfg["key"], title, sections)
         if ch == "pushplus":
-            return push_pushplus(e("PUSHPLUS_TOKEN"), title, sections)
+            return push_pushplus(cfg["token"], title, sections)
         if ch == "bark":
-            return push_bark(e("BARK_KEY"), title, sections, e("BARK_URL"))
+            return push_bark(cfg["key"], title, sections, cfg.get("server") or "")
         if ch == "ntfy":
-            return push_ntfy(e("NTFY_TOPIC"), title, sections, e("NTFY_URL"))
+            return push_ntfy(cfg["topic"], title, sections, cfg.get("server") or "")
         if ch == "telegram":
-            return push_telegram(e("TELEGRAM_BOT_TOKEN"), e("TELEGRAM_CHAT_ID"),
-                                 title, sections)
+            return push_telegram(cfg["bot_token"], cfg["chat_id"], title, sections)
         if ch == "email":
-            return push_email(e("SMTP_HOST"), int(e("SMTP_PORT") or "465"),
-                              e("SMTP_USER"), os.environ.get("SMTP_PASS") or "",
-                              e("MAIL_TO") or e("SMTP_USER"),
+            return push_email(cfg["host"], int(cfg.get("port") or 465), cfg["user"],
+                              cfg.get("pass") or "", cfg.get("to") or cfg["user"],
                               "[Buddy加油站] %s · %s" % (stamp, env),
                               "%s\n\n%s" % (title, _fmt_sections(sections, md=False)))
     except Exception as ex:  # noqa: BLE001
@@ -962,6 +1172,7 @@ def run_one(acc: Account, dry_run: bool = False) -> dict:
     api = Api(acc.endpoint, acc.token, acc.uid, acc.domain)
     checkin = do_checkin(api, dry_run)
     cat = do_cat(api, dry_run)          # 独立 try，炸了也只影响本段
+    resolved, problems = account_channels(acc)
     return {
         "name": acc.name,
         "uid": redact(acc.uid),
@@ -970,13 +1181,14 @@ def run_one(acc: Account, dry_run: bool = False) -> dict:
         "checkin": checkin,
         "cat": cat,
         "_trace": api.trace,
-        "_webhook": acc.webhook,
-        "_secret": acc.secret,
+        "_notify": resolved,               # {渠道: 配置}，可能为空
+        "_notify_problems": problems,
+        "_declared_notify": bool(acc.notify),
     }
 
 
 def _public(obj: Any) -> Any:
-    """去掉内部字段（含专属 webhook / 签名密钥）。"""
+    """去掉内部字段（含账号自带的渠道凭据）。"""
     if isinstance(obj, dict):
         return {k: _public(v) for k, v in obj.items() if not k.startswith("_")}
     if isinstance(obj, list):
@@ -990,24 +1202,35 @@ def _sections_of(results: list[dict]) -> list[dict]:
 
 
 def notify(results: list[dict], stamp: str, env: str) -> list[str]:
-    """推送。
+    """推送。逐人分层，互不牵连：
 
-    * 账号自带 webhook 的：单独发给他自己的群（飞书），不混进大卡片；
-    * 其余的：按 detect_channels() 得出的渠道，每个渠道各发一份。
+    * 声明了自己的渠道（`notify`）的账号：**只**发给他自己那几个渠道，
+      不混进汇总卡片，也不受全局 NOTIFY_CHANNELS 影响；
+    * 其余账号：汇总成一份，发到全局渠道（detect_channels）。
 
     单个渠道失败只写进 notices，不影响退出码，也不影响别的渠道。
     """
     notices: list[str] = []
-    shared = [r for r in results if not r["_webhook"]]
-    own = [r for r in results if r["_webhook"]]
+    shared: list[dict] = []
     title = "Buddy 加油站日报 · %s · %s" % (stamp, env)
 
-    # ① 账号专属群
-    for r in own:
-        notices.append("%s：%s" % (r["name"], push_feishu(
-            r["_webhook"], stamp, env, _sections_of([r]), r["checkin_ok"], r["_secret"])))
+    # ① 各人发自己的
+    for r in results:
+        for p in (r.get("_notify_problems") or []):
+            notices.append("%s（通知）：%s" % (r["name"], p))
+        resolved = r.get("_notify") or {}
+        if not resolved:
+            # 没声明过渠道 -> 并入汇总；
+            # 声明了但没配全 -> 只报上面那条问题，不再补发汇总（尊重「我只收自己的渠道」）
+            if not r.get("_declared_notify"):
+                shared.append(r)
+            continue
+        secs = _sections_of([r])
+        for ch, cfg in resolved.items():
+            notices.append("%s → %s" % (r["name"], _dispatch(
+                ch, cfg, stamp, env, title, secs, r["checkin_ok"])))
 
-    # ② 全局渠道
+    # ② 没人认领的账号汇总成一份，发到全局渠道
     if shared:
         channels = detect_channels()
         if not channels:
@@ -1016,7 +1239,7 @@ def notify(results: list[dict], stamp: str, env: str) -> list[str]:
             secs = _sections_of(shared)
             ok = all(r["checkin_ok"] for r in shared)
             for ch in channels:
-                notices.append(_dispatch(ch, stamp, env, title, secs, ok))
+                notices.append(_dispatch(ch, _env_cfg(ch), stamp, env, title, secs, ok))
 
     return notices
 
@@ -1066,19 +1289,26 @@ def main() -> int:
 
     print("[cred] 共 %d 个账号，预算 %.0fs" % (len(accounts), _BUDGET), file=sys.stderr)
     for a in accounts:
-        print("  - %s  uid=%s  token=%s  %s"
-              % (a.name, redact(a.uid), redact(a.token), a.endpoint), file=sys.stderr)
+        chans, problems = account_channels(a)
+        where = "、".join(CHANNEL_LABEL.get(c, c) for c in chans) or (
+            "汇总卡片" if not a.notify else "（渠道没配全，见下方 notices）")
+        print("  - %s  uid=%s  token=%s  推送=%s  %s"
+              % (a.name, redact(a.uid), redact(a.token), where, a.endpoint), file=sys.stderr)
+        for p in problems:
+            print("    ⚠️ %s" % p, file=sys.stderr)
 
     results: list[dict] = []
     for a in accounts:
         if _budget_left() <= 1:
+            resolved, problems = account_channels(a)
             results.append({
                 "name": a.name, "uid": redact(a.uid), "checkin_ok": False, "cat_ok": False,
                 "checkin": {"ok": False, "segment": "签到", "result": "SKIPPED",
                             "lines": ["⏱ 时间预算已耗尽，本账号本轮跳过（下轮会自动补上）"]},
                 "cat": {"ok": False, "segment": "猫猫旅行", "result": "SKIPPED",
                         "lines": ["⏱ 时间预算已耗尽，本段跳过"]},
-                "_trace": [], "_webhook": a.webhook, "_secret": a.secret})
+                "_trace": [], "_notify": resolved, "_notify_problems": problems,
+                "_declared_notify": bool(a.notify)})
             continue
         results.append(run_one(a, args.dry_run))
 

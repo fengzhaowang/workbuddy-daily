@@ -1,5 +1,13 @@
 {
   "_说明": "示例文件，仅用于说明格式，可以直接提交进仓库。真实清单由 scripts/export_token.py 生成到 accounts.local.json（已在 .gitignore 里，权限 600）。",
+  "_notify说明": [
+    "notify 决定『这个人的结果发给谁』，不写就并进汇总卡片（发给全局渠道）。",
+    "写法一：只写渠道名 -> 借全局 secret（适合『全局配一份，各人只选渠道』）。",
+    "写法二：带上字段 -> 用他自己的凭据，绝不用全局的兜底（避免把 A 的密钥发到 B 的群里）。",
+    "写法三：channels 列表 = 白名单，没点到的渠道即使写了配置也不发；写空数组 = 回到汇总卡片。",
+    "凭据『给了一部分』但没配全（缺必填字段）时，这个人这条不发，并在运行结果里明确报一句，",
+    "不会静默失败，也不会把他悄悄塞回汇总卡片。"
+  ],
   "accounts": [
     {
       "name": "我",
@@ -8,18 +16,45 @@
       "domain": "www.workbuddy.cn"
     },
     {
-      "name": "小号",
+      "name": "小号（借全局渠道，只收自己的那一份）",
       "token": "同上",
       "uid": "同上",
-      "domain": "www.workbuddy.cn"
+      "domain": "www.workbuddy.cn",
+      "notify": ["dingtalk"]
     },
     {
       "name": "同事A（结果单独发他自己的群）",
       "token": "同上",
       "uid": "同上",
       "domain": "www.workbuddy.cn",
+      "notify": {
+        "channels": ["wecom", "serverchan"],
+        "wecom": { "webhook": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=换成他自己的" },
+        "serverchan": { "key": "SCTxxxxx" }
+      }
+    },
+    {
+      "name": "同事B（旧写法仍然兼容，等价于 notify.feishu）",
+      "token": "同上",
+      "uid": "同上",
+      "domain": "www.workbuddy.cn",
       "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/换成他自己的机器人地址",
       "secret": "只有该机器人开了「签名校验」时才需要填"
+    },
+    {
+      "name": "同事C（邮箱）",
+      "token": "同上",
+      "uid": "同上",
+      "domain": "www.workbuddy.cn",
+      "notify": {
+        "email": {
+          "host": "smtp.qq.com",
+          "port": 465,
+          "user": "someone@qq.com",
+          "pass": "邮箱 SMTP 授权码，不是登录密码",
+          "to": "someone@qq.com"
+        }
+      }
     }
   ]
 }

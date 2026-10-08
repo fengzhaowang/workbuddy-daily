@@ -14,8 +14,10 @@
 2. **猫猫旅行**：
    - ① 先领掉**已经到家**那一趟的旅行积分；
    - ② 再判断今天还能不能派新的一趟——`daily_limit_reached` 为真（今天已经派过）就不派。
-3. **推送通知**：默认把没有专属 webhook 的账号汇总成**一份**，每个账号一个分区、区内「🏠 签到」「🐾 猫猫」分行写清；
-   某个账号如果配了专属 webhook，则**单独发给他自己的群**。支持 9 种通知渠道，配哪个发哪个（见下）。
+3. **推送通知**：分两层，**可以逐人定制**——
+   - **每个人自己的渠道**：账号清单里给他写 `notify`，他那一份就**只发到他自己指定的渠道**（可多个），不进汇总卡片；
+   - **没配的人**：汇总成**一份**，每个账号一个分区、区内「🏠 签到」「🐾 猫猫」分行写清，发到全局渠道。
+   共支持 9 种通知渠道，配哪个发哪个（见下）。
 4. **隔离**：
    - **账号之间互相隔离**——A 的 token 过期，B 照常签到；
    - **账号内部**，猫猫段被 `try` 兜住——它怎么炸都不改该账号的签到结论。
@@ -49,6 +51,9 @@
 NOTIFY_CHANNELS: dingtalk,email   # 只发这两个
 NOTIFY_CHANNELS: all              # 所有已配置的渠道（默认就是这个行为）
 ```
+
+> 这一节说的是**全局那一层**（收「汇总卡片」，以及那些在 `notify` 里只写渠道名、想借全局凭据的人）。
+> 想让每个人各收各的、各用各的渠道，见下面的「[每人收自己的通知](#每人收自己的通知可以逐人配各用各的渠道)」。
 
 **一个都没配也不会报错**，只在运行结果里明确写一句「未配置任何推送渠道，已跳过」——
 不会静默失败。某个渠道发失败也只影响它自己，既不改退出码，也不影响别的渠道。
@@ -147,20 +152,22 @@ git push -u origin main
 
 ## 多人/多账号怎么用
 
-清单就是一个 JSON 数组，**一个 secret 装 N 个账号**：
+清单就是一个 JSON 数组，**一个 secret 装 N 个账号**（`notify` 决定这一份发给谁，不写就进汇总卡片）：
 
 ```json
 {
   "accounts": [
     {"name": "我",     "token": "eyJ...", "uid": "xxx", "domain": "www.workbuddy.cn"},
-    {"name": "小号",   "token": "eyJ...", "uid": "yyy", "domain": "www.workbuddy.cn"},
+    {"name": "小号",   "token": "eyJ...", "uid": "yyy", "domain": "www.workbuddy.cn",
+     "notify": ["dingtalk"]},
     {"name": "同事A",  "token": "eyJ...", "uid": "zzz", "domain": "www.workbuddy.cn",
-     "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxx"}
+     "notify": {"wecom": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxx"}}
   ]
 }
 ```
 
-字段尽量宽容（`token`/`access_token`、`uid`/`user_id` 都认）；完整示例见 `accounts.example.json`。
+字段尽量宽容（`token`/`access_token`、`uid`/`user_id` 都认，渠道名认中文和简写）；
+完整示例见 `accounts.example.json`。
 
 **加账号的三种方式：**
 
@@ -179,7 +186,7 @@ python3 scripts/export_token.py --import 同事给的.json
 **清理重复：** `python3 scripts/export_token.py --dedupe`
 
 判重按 **uid**，不是按名字——所以同一个人用两个名字各跑一次 `--as` 也只会留一条
-（保留带专属 webhook 的那条）。没有 uid 的旧凭证退回按 token 判。
+（保留带自己通知配置的那条）。没有 uid 的旧凭证退回按 token 判。
 `--list` 会把「其实是同一个人」的条目直接点名出来。
 
 > `--add-local`（以及不带任何参数的默认动作）合并时**先按名字、再按 uid**。
@@ -187,16 +194,103 @@ python3 scripts/export_token.py --import 同事给的.json
 > 就得到两条同一个人——云端「共 2 个账号」其实只覆盖 1 个人，白占一份时间预算，
 > 卡片上还重复一遍。
 
-### 每人收自己的通知
+### 每人收自己的通知（可以逐人配、各用各的渠道）
 
-给某个账号填上他自己的 `webhook`（**目前只支持飞书机器人**），**他那一份就单独发到他自己的群**，不混进汇总：
+默认是把没配 `notify` 的人汇总成一份发给全局渠道。想让人各收各的，就在他名下写 `notify`：
+
+**写法一：只选渠道，凭据用全局的**（最省事——全局只配一份，各人自己挑）
+
+```json
+{"name":"小号", "token":"eyJ...", "uid":"yyy", "domain":"www.workbuddy.cn",
+ "notify": ["dingtalk"]}
+```
+
+小号的结果会**单独一条**发到钉钉（用全局 `DINGTALK_WEBHOOK`），不再进汇总卡片。
+全局凭据没配全的话，运行结果里会明确写「钉钉：凭据来自全局 secret，但缺 webhook」，
+不会静默不发。
+
+**写法二：带自己的凭据**（他自己建的群 / 自己的微信推送 / 自己的邮箱）
+
+```json
+{"name":"同事A", "token":"eyJ...", "uid":"zzz", "domain":"www.workbuddy.cn",
+ "notify": {
+   "channels": ["wecom", "serverchan"],
+   "wecom":      {"webhook": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=他的"},
+   "serverchan": {"key": "SCT他的"}
+ }}
+```
+
+一个渠道也能写成一整串（值直接落到该渠道的主字段）：
+
+```json
+"notify": {"wecom": "https://qyapi.weixin.qq.com/...", "email": "他@qq.com"}
+```
+
+**写法三：白名单**——`channels` 是白名单，没点到的渠道即使写了配置也不发；
+写成 `"channels": []` 就等于回到汇总卡片。
+
+#### 三条关键规则
+
+| 规则 | 为什么 |
+| --- | --- |
+| **自带凭据 = 只用自带的，绝不拿全局的兜底** | 否则会把 A 的机器人密钥发进 B 的群、B 的邮箱——串号比不发更糟 |
+| **配了 `notify` 就不进汇总卡片** | 尊重「我只收自己渠道」的意图；不想收到大卡片的人不会收到 |
+| **配了但没配全 → 只报问题，不静默补发汇总** | 少字段会在运行结果的 `notices` 里点名，一眼能看出是谁没收到 |
+
+#### 不用手抄 JSON，用命令配
+
+```bash
+# 先看这个人在发给谁
+python3 scripts/export_token.py --notify "李灏然"
+
+# 只选渠道（借全局凭据）
+python3 scripts/export_token.py --notify "李灏然" --use dingtalk
+
+# 带上他自己的凭据（一个渠道一条 --use，可写多次）
+python3 scripts/export_token.py --notify "李灏然" --use 'serverchan:key=SCTxxxxx'
+python3 scripts/export_token.py --notify "李灏然" \
+    --use 'wecom:webhook=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx' \
+    --use 'email:host=smtp.qq.com,user=me@qq.com,pass=授权码,to=me@qq.com'
+
+# 改回「并进汇总卡片」
+python3 scripts/export_token.py --notify "李灏然" --clear-notify
+
+# 忘了某个渠道要哪些字段？先看这张表
+python3 scripts/export_token.py --channels
+```
+
+字段名写错、必填项漏了会**当场报错**（不用等云端跑完才发现某人一条通知都没收到），
+渠道名也认中文（`企微` / `钉钉` / `邮件` / `飞书`）。
+
+> ⚠️ **改完要重新推一次 secret**，因为「谁发给谁」就存在 `WB_ACCOUNTS` 里：
+> `python3 scripts/export_token.py --repo <owner/name> --push`
+> （用网页粘贴的，重新跑 `--print-json` 覆盖一下那个 secret。）
+
+#### 配完先体检一遍，别等 Actions 跑失败
+
+```bash
+python3 scripts/test_notify.py --plan --from accounts.local.json   # 只看路由，不发消息、不打印凭证
+python3 scripts/test_notify.py --plan                              # 或直接读环境变量 WB_ACCOUNTS
+```
+
+输出形如：
 
 ```
-{"name":"同事A", "token":"...", "uid":"...", "webhook":"https://open.feishu.cn/..."}
+  1. 甲        → 企业微信（自带）
+  2. 乙        → 钉钉（借全局）
+  3. 丙        → 汇总卡片
+全局渠道（NOTIFY_CHANNELS 未点名）：钉钉、Server酱
 ```
 
-没填 `webhook` 的账号，全部汇总成一份，发到你在上面配的那些**全局渠道**。
-（这样「同事们各自建群、各自收自己的结果」和「一个人看全量」可以同时成立。）
+它会顺带把「张三声明了渠道但没配全」「有汇总卡片要发却一个全局渠道都没配」这类问题指出来。
+确认路由无误后，再按渠道跑一次真实自检（会真的发一条）：
+`python3 scripts/test_notify.py --channel dingtalk`。
+
+#### 旧写法仍然兼容
+
+账号上直接写 `webhook` / `secret`（只支持飞书）等价于 `notify.feishu`。
+清单文件里的旧写法会在下次写入时自动迁移成 `notify`；
+刷新 token（`--as` / `--import`）时**不会**冲掉某人的 `notify` 配置。
 
 ### 各账号怎么拿 token
 
@@ -221,9 +315,12 @@ python3 scripts/export_token.py --import 同事给的.json
 
 **通知渠道（一个都不配也能跑，只是不发通知；配几个发几个）**
 
+> 下面这些是**全局** secret，供「没配 `notify` 的人」的汇总卡片、以及「`notify` 里只写渠道名想借全局」的人使用。
+> 某个人想用自己的机器人 / 自己的微信推送 / 自己的邮箱，那些凭据写在 `WB_ACCOUNTS` 的 `notify` 里，不用另外建 secret。
+
 | 名称 | 渠道 | 说明 |
 | --- | --- | --- |
-| `NOTIFY_CHANNELS` | — | 可选。点名要发哪几个，如 `dingtalk,email` 或 `all` |
+| `NOTIFY_CHANNELS` | — | 可选。点名全局要发哪几个，如 `dingtalk,email` 或 `all`；**不影响**各人自己的 `notify` |
 | `SERVERCHAN_KEY` | Server酱 | 推微信，扫码即可 |
 | `PUSHPLUS_TOKEN` | PushPlus | 推微信，扫码即可 |
 | `WECOM_WEBHOOK` | 企业微信 | 群机器人 Webhook |
@@ -336,16 +433,23 @@ on:
 ```bash
 python3 scripts/daily.py --local --as "我的名字"      # 本机单账号
 python3 scripts/daily.py --accounts accounts.local.json   # 本机多账号（读清单文件）
-python3 scripts/daily.py --list-accounts              # 只列出识别到的账号（脱敏）
+python3 scripts/daily.py --list-accounts              # 只列出识别到的账号（脱敏 + 推送去向）
 python3 scripts/daily.py --only "我,同事A"             # 只跑指定账号（名字或序号）
 python3 scripts/daily.py --local --raw                # 附上脱敏后的原始返回
 python3 scripts/daily.py --local --dry-run            # 只查状态，不做写操作
 python3 scripts/daily.py --local --no-notify          # 不推送，只看结论
+python3 scripts/test_offline.py                       # 离线全链路自测（假服务端，不开外网）
 python3 scripts/test_notify.py                        # 试通知渠道（真的发一条，失败给原因）
+python3 scripts/test_notify.py --plan --from accounts.local.json  # 只体检路由，不发消息
 python3 scripts/test_notify.py --channel ntfy --print  # 只看会发出去什么内容，不真发
 ```
 
 `--raw` 会把每个账号的接口往返都附在 JSON 里，敏感字段被替换成 `<前6>***<后4>(len=N)`。
+账号自带的渠道凭据（`notify` 里的 webhook / key / 邮箱授权码）属于内部字段，
+**任何输出里都不会出现**，只会以「自带 / 借全局」的形式出现。
+
+改完代码先跑 `test_offline.py` 再提交：它用本机假服务端把「签到 → 派猫 → 按人分发」整条链路
+真跑一遍，并断言「谁的内容发到了哪个地址」，能挡住「看起来对、其实把 A 的结果发给了 B」这类错。
 
 ---
 
@@ -399,9 +503,10 @@ workbuddy-daily/
 ├── .github/workflows/daily.yml   # 定时任务：解释器路径用 command -v 动态取
 ├── scripts/
 │   ├── wb_auth.py                # 本机登录态解密（只有刷新脚本用得到）
-│   ├── export_token.py           # 刷新脚本：本机 → 账号清单 → 仓库 secret
-│   ├── daily.py                  # 云端每天跑这个（多账号 + 多通知渠道）
-│   └── test_notify.py            # 通知渠道自检（真的发一条，失败给出原因）
+│   ├── export_token.py           # 刷新脚本：本机 → 账号清单 → 仓库 secret（含逐人通知配置）
+│   ├── daily.py                  # 云端每天跑这个（多账号 + 逐人/全局两级通知）
+│   ├── test_notify.py            # 通知渠道自检（真的发一条，失败给出原因）+ 路由体检
+│   └── test_offline.py           # 离线全链路自测（假服务端，验证「谁发给谁」）
 ├── accounts.example.json         # 账号清单格式示例（可提交）
 ├── accounts.local.json           # 你的真实清单（自动生成，600 权限，已在 .gitignore）
 ├── .gitignore
