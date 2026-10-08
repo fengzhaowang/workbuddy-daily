@@ -19,6 +19,7 @@
   python3 scripts/export_token.py --import team.json    # 合并别人给的账号 JSON
   python3 scripts/export_token.py --list                # 看清单（脱敏 + 剩余有效期）
   python3 scripts/export_token.py --remove "小号"        # 移除账号
+  python3 scripts/export_token.py --dedupe              # 清理重复（同一个人只留一条）
   python3 scripts/export_token.py --check               # 逐个验活
   python3 scripts/export_token.py --repo <owner/name> --check   # 验活后写进仓库 secret
   python3 scripts/export_token.py --print-json          # 打印明文 JSON，手动粘进 GitHub 网页
@@ -75,13 +76,64 @@ def wire_payload(accounts: list[dict]) -> str:
 
 
 def upsert(accounts: list[dict], entry: dict) -> str:
-    """按名字合并；同名覆盖。返回 'added' 或 'updated'。"""
+    """合并进清单：先按名字找，找不到再按 uid 兜底。返回 added / updated / merged。
+
+    按 uid 兜底很关键：本机登录态只有一个人，`--as 甲` 跑一次、`--as 乙` 再跑一次，
+    如果只按名字判重就会得到两条同一个人——云端「共 2 个账号」其实只有 1 个人，
+    白占一份时间预算，卡片上还重复一遍。命中时保留原有的名字和专属 webhook
+    （名字是人有意的命名，webhook 是有意的配置，都不该被本机登录态冲掉）。
+    """
     for i, a in enumerate(accounts):
         if a.get("name") == entry["name"]:
             accounts[i] = entry
             return "updated"
+    uid = entry.get("uid")
+    if uid:
+        for i, a in enumerate(accounts):
+            if a.get("uid") == uid:
+                merged = dict(entry)
+                merged["name"] = a.get("name") or entry["name"]
+                for k in ("webhook", "secret"):
+                    if a.get(k):
+                        merged[k] = a[k]
+                accounts[i] = merged
+                return "merged"
     accounts.append(entry)
     return "added"
+
+
+def dedupe(accounts: list[dict]) -> tuple[list[dict], list[str]]:
+    """同一个人只留一条。
+
+    判重按 uid（没有 uid 就退回 token 前缀）——**不能只按名字**，
+    否则 `--as 甲` 和 `--as 乙` 分别跑一次就会把同一个人塞进去两条，
+    结果云端「共 2 个账号」其实只有 1 个人，白占一份时间预算、卡片上还重复一遍。
+    保留顺序：带专属 webhook 的 > 先出现的。
+    """
+    kept: list[dict] = []
+    removed: list[str] = []
+    index: dict[str, int] = {}
+    for a in accounts:
+        key = a.get("uid") or ("tok:" + (a.get("token") or "")[:64])
+        if key not in index:
+            index[key] = len(kept)
+            kept.append(a)
+            continue
+        prev = kept[index[key]]
+        if a.get("webhook") and not prev.get("webhook"):
+            removed.append(prev.get("name") or "?")
+            kept[index[key]] = a
+        else:
+            removed.append(a.get("name") or "?")
+    return kept, removed
+
+
+def find_duplicates(accounts: list[dict]) -> list[str]:
+    groups: dict[str, list[str]] = {}
+    for a in accounts:
+        key = a.get("uid") or ("tok:" + (a.get("token") or "")[:64])
+        groups.setdefault(key, []).append(a.get("name") or "?")
+    return ["%s" % "、".join(v) for v in groups.values() if len(v) > 1]
 
 
 # ---------------- 取本机账号 ----------------
@@ -151,6 +203,12 @@ def show_list(accounts: list[dict]) -> None:
         print(line)
         if a.get("expires_at"):
             print("     有效期：%s" % local_meta(a))
+    dups = find_duplicates(accounts)
+    if dups:
+        print()
+        for d in dups:
+            print("  ⚠️ 这几条其实是同一个人：%s" % d)
+        print("     -> 跑一次 --dedupe 清掉（只按 uid 判重，不会误删不同的人）")
 
 
 # ---------------- 主流程 ----------------
@@ -161,6 +219,8 @@ def main() -> int:
     ap.add_argument("--as", dest="as_name", help="本机账号的显示名，便于多人区分")
     ap.add_argument("--import", dest="import_file", metavar="FILE", help="合并一个账号 JSON 文件")
     ap.add_argument("--remove", metavar="NAME", help="按名字移除账号")
+    ap.add_argument("--dedupe", action="store_true",
+                    help="清理重复：同一个人（uid 相同）只留一条，带专属 webhook 的优先")
     ap.add_argument("--list", action="store_true", help="列出清单（脱敏）")
     ap.add_argument("--check", action="store_true", help="逐个验活")
     ap.add_argument("--print-json", action="store_true",
@@ -186,6 +246,18 @@ def main() -> int:
         save_store(args.store, accounts)
         print("✅ 已移除「%s」，剩 %d 个账号" % (args.remove, len(accounts)), file=sys.stderr)
 
+    # ---- 去重 ----
+    if args.dedupe:
+        before = len(accounts)
+        accounts, removed = dedupe(accounts)
+        if removed:
+            save_store(args.store, accounts)
+            print("✅ 已去重：删除 %s（%d -> %d 个账号）"
+                  % ("、".join("「%s」" % n for n in removed), before, len(accounts)),
+                  file=sys.stderr)
+        else:
+            print("✅ 没有重复条目（共 %d 个账号）" % len(accounts), file=sys.stderr)
+
     # ---- 导入 ----
     merged = False
     if args.import_file:
@@ -207,10 +279,13 @@ def main() -> int:
             print("❌ 导入失败：%s" % e, file=sys.stderr)
             return 2
 
-    # ---- 把本机账号加入清单（除非用户明确只做只读/导入动作）----
-    skip_local = args.list or args.show or args.import_file
+    # ---- 把本机账号加入清单 ----
+    # 只有「明确 --add-local」或「什么动作都没给」时才读本机登录态并入清单。
+    # 否则 --remove / --dedupe 刚做完的事会被这条默认动作又加回去，白折腾。
+    explicit_action = (args.list or args.show or args.import_file or args.remove
+                       or args.dedupe)
     added = None
-    if args.add_local or not skip_local:
+    if args.add_local or not explicit_action:
         try:
             c = load_credentials()
         except AuthError as e:
@@ -219,13 +294,15 @@ def main() -> int:
         entry = local_entry(args.as_name)
         added = upsert(accounts, entry)
         save_store(args.store, accounts)
+        what = {"added": "新增", "updated": "覆盖同名", "merged": "合并进同一账号的已有条目"}[added]
         print("来源文件：%s" % c["auth_file"], file=sys.stderr)
-        print("账号 uid：%s（%s）" % (redact(c["uid"]), added == "added" and "新增" or "覆盖同名"),
-              file=sys.stderr)
+        print("账号 uid：%s（%s）" % (redact(c["uid"]), what), file=sys.stderr)
         print("token   ：%s" % redact(c["token"]), file=sys.stderr)
         print("域名    ：%s" % (c.get("domain") or "-"), file=sys.stderr)
         print("有效期  ：%s" % local_meta(entry), file=sys.stderr)
         print("✅ 清单已更新：%s（共 %d 个账号）" % (args.store, len(accounts)), file=sys.stderr)
+        for d in find_duplicates(accounts):
+            print("⚠️ 仍有同一个人出现多条：%s（跑 --dedupe 清掉）" % d, file=sys.stderr)
 
     # ---- 验活（走 stderr，把 stdout 留给 --print-json 的纯 JSON）----
     if args.check:
