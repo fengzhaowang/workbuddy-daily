@@ -18,12 +18,19 @@ concurrency:
 
 jobs:
   daily:
-    runs-on: ubuntu-latest
+    # 固定镜像版本，不用 ubuntu-latest。
+    # GitHub 已公告 ubuntu-latest 将于 2026-10-19 迁移到 Ubuntu 26——
+    # 那时 python3 版本、OpenSSL 策略都可能变，.latest 会静默换底。
+    # 钉死 24.04 保证每天跑的是同一套环境；要升级时手动改这一行。
+    runs-on: ubuntu-24.04
     # 时间预算随账号数放大（脚本内 WB_BUDGET_SECONDS），这里留足余量。
     # 账号特别多时（比如 10 个以上）相应调大，或把账号拆成多个 workflow。
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      # v5 起用 Node 24；v4 是 Node 20，runner 上会打弃用告警并强制降级运行
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
 
       - name: 签到 + 派猫猫，并推送通知
         env:

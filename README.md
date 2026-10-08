@@ -240,6 +240,30 @@ on:
 **cron 是 UTC 时间**，换算规则：`北京时间 = UTC + 8`。
 GitHub 的定时任务在高峰时段可能延迟几分钟到几十分钟，属正常现象。
 
+### 运行环境：镜像钉死，不用 `ubuntu-latest`
+
+```yaml
+runs-on: ubuntu-24.04        # 不用 ubuntu-latest
+steps:
+  - uses: actions/checkout@v5
+```
+
+两个原因，都是「别让环境在你不知道的时候变」：
+
+- **`ubuntu-latest` 会自己换底。** GitHub 已公告该标签自 2026-10-19 起分几周内切换为 Ubuntu 26.04
+  （[runner-images#14748](https://github.com/actions/runner-images/issues/14748)），
+  完成时间约 2026-11-19。`latest` 是自动生效的，你不用改也会跟着变——
+  而 Ubuntu 26.04 的 python3 版本、系统库、SSL 策略都和 24.04 不同。
+  钉死 `ubuntu-24.04` 就是让每天跑的是同一套东西；想升级时手动改这一行。
+- **`actions/checkout@v4` 跑在 Node 20 上，已被弃用。** runner 现在会强制用 Node 24 执行它并打告警。
+  `v5` 的 `action.yml` 声明的是 `using: node24`，换上去告警就没了。
+
+> 校验方式（不是猜的）：`curl -sSL https://raw.githubusercontent.com/actions/checkout/v5.1.0/action.yml | grep -A2 '^runs:'`
+> → `using: node24`；同样办法看 `v4.4.0` → `using: node20`。
+
+这两条都是**告警，不影响结果**——但它们属于「今天不修，将来某天静默挂掉」那类。
+本项目除了 checkout 没有别的 action，所以换完就没有 Node 相关的告警了。
+
 ### 两个必须知道的坑
 
 **① 仓库连续 60 天没有新提交，GitHub 会自动停掉 schedule。**
