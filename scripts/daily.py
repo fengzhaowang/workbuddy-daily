@@ -6,8 +6,15 @@
   2. 猫猫旅行：先领掉「已到家」那一趟的旅行积分，再判断今天还能不能派新的一趟；
      今天已经派过（daily_limit_reached）就不派。
 
-结果推送飞书：默认所有账号汇总成**一张卡片**，每个账号一个分区、区内
-「🏠 签到」与「🐾 猫猫」分行写清；某个账号如果自带 webhook，则单独发给他自己的群。
+结果推送：默认把没有专属 webhook 的账号汇总成**一份**，每个账号一个分区、
+区内「🏠 签到」与「🐾 猫猫」分行写清；某个账号如果自带 webhook，
+则单独发给他自己的群。
+
+通知渠道可插拔，支持 9 种，**配了哪个就发哪个**（配几个发几个）：
+  飞书 / 企业微信 / 钉钉 / Server酱 / PushPlus / Bark / ntfy / Telegram / 邮件
+用 NOTIFY_CHANNELS 点名可以只发其中几个（例：NOTIFY_CHANNELS=dingtalk,email）。
+一个渠道都没配不会报错，只是在结果里提示一句。某个渠道失败只写进 notices，
+既不影响退出码，也不影响别的渠道。
 
 隔离层级（重要）：
   * 账号之间互相隔离——A 的 token 过期不影响 B 照常签到；
@@ -606,9 +613,51 @@ def _buddy_name(api: Api) -> str:
 # ================= 推送 =================
 NOTE_TEXT = "各账号互相隔离 · 猫猫段失败不影响该账号签到结论 · 由 GitHub Actions 定时执行"
 
+# 支持的推送渠道。没配 NOTIFY_CHANNELS 时按这个顺序自动探测：
+# 哪个渠道的 secret 配了，就发哪个；配了几个就发几个。
+# 不想全发就用 NOTIFY_CHANNELS 点名，例：NOTIFY_CHANNELS=dingtalk,email
+NOTIFY_ORDER = ("feishu", "wecom", "dingtalk", "serverchan", "pushplus",
+                "bark", "ntfy", "telegram", "email")
+
+CHANNEL_LABEL = {
+    "feishu": "飞书", "wecom": "企业微信", "dingtalk": "钉钉",
+    "serverchan": "Server酱", "pushplus": "PushPlus", "bark": "Bark",
+    "ntfy": "ntfy", "telegram": "Telegram", "email": "邮件",
+}
+
+
+# 每次 POST 的原始返回都记在这里，供自检脚本（scripts/test_notify.py）
+# 打印出来做诊断。正常运行时没人读它，纯观测用途。里面可能含渠道密钥，
+# 所以只在自检脚本本地打印，不进任何输出。
+LAST_TRACE: list[dict] = []
+
 
 def _lines_to_md(lines: list[str]) -> str:
     return "\n".join(l for l in lines if l).strip() or "（无输出）"
+
+
+def _lines_to_plain(lines: list[str]) -> str:
+    """去掉 markdown 记号，给只认纯文本的渠道（Bark / ntfy / 邮件）。"""
+    return "\n".join(re.sub(r"\*\*|<[^>]+>", "", l)
+                     for l in lines if l).strip() or "（无输出）"
+
+
+def _fmt_sections(sections: list[dict], md: bool = True) -> str:
+    """把各账号拼成一段文本：每个账号一块，块内「签到」「猫猫」分行。"""
+    multi = len(sections) > 1
+    blocks = []
+    for i, s in enumerate(sections):
+        if multi:
+            head = "**%d. %s**" % (i + 1, s["name"]) if md else "%d. %s" % (i + 1, s["name"])
+        else:
+            head = "**%s**" % s["name"] if md else s["name"]
+        ck = _lines_to_md(s.get("checkin") or []) if md else _lines_to_plain(s.get("checkin") or [])
+        ct = _lines_to_md(s.get("cat") or []) if md else _lines_to_plain(s.get("cat") or [])
+        if md:
+            blocks.append("%s\n🏠 **签到**\n%s\n🐾 **猫猫**\n%s" % (head, ck, ct))
+        else:
+            blocks.append("%s\n🏠 签到\n%s\n🐾 猫猫\n%s" % (head, ck, ct))
+    return "\n\n".join(blocks)
 
 
 def build_feishu_card(stamp: str, env: str, sections: list[dict],
@@ -618,7 +667,7 @@ def build_feishu_card(stamp: str, env: str, sections: list[dict],
     多账号：每个账号一个分区，分区内「🏠 签到」「🐾 猫猫」分行写清；
     单账号时 structure 一样，只是只有一个分区。
 
-    单独抽出来是为了让自检脚本（scripts/test_feishu.py）用**同一个**构造函数，
+    单独抽出来是为了让自检脚本（scripts/test_notify.py）走**同一条**发送路径，
     避免「自检能通、线上不通」这种最难查的偏差。
 
     sections: [{"name": str, "checkin": [lines], "cat": [lines]}, ...]
@@ -663,45 +712,248 @@ def push_feishu(webhook: str, stamp: str, env: str, sections: list[dict],
 
 
 def push_wecom(webhook: str, sections: list[dict], title: str) -> str:
-    blocks = "\n\n".join(
-        "**%s**\n\n**🏠 加油站签到**\n%s\n\n**🐾 猫猫旅行**\n%s"
-        % (s["name"], _lines_to_md(s.get("checkin") or []), _lines_to_md(s.get("cat") or []))
-        for s in sections)
-    return _post_json(webhook, {"msgtype": "markdown",
-                                "markdown": {"content": "**%s**\n\n%s" % (title, blocks)}},
+    """企业微信群机器人：markdown 消息。
+
+    不需要企业认证，手机上装个企业微信、自己建个群就能用，
+    形态跟飞书最接近（都是「建群 → 加机器人 → 复制 Webhook」）。
+    """
+    content = "**%s**\n\n%s" % (title, _fmt_sections(sections))
+    return _post_json(webhook, {"msgtype": "markdown", "markdown": {"content": content}},
                       "企业微信")
+
+
+def push_dingtalk(webhook: str, sections: list[dict], title: str, secret: str = "") -> str:
+    """钉钉群机器人：markdown 消息，支持「加签」安全模式。
+
+    钉钉的加签跟飞书同源：sign = base64(HMAC-SHA256(key = timestamp + "\\n" + secret, msg = ""))，
+    但 timestamp 是**毫秒**，且 timestamp/sign 要拼在 URL 查询参数上（不是放 body）。
+    安全模式三选一里务必用「加签」——GitHub runner 的出口 IP 是动态的，「IP 白名单」必挂。
+    """
+    url = webhook
+    if secret:
+        import base64
+        import hashlib
+        import hmac
+        import urllib.parse
+        ts = str(int(round(time.time() * 1000)))
+        key = ("%s\n%s" % (ts, secret)).encode("utf-8")
+        sign = urllib.parse.quote_plus(base64.b64encode(
+            hmac.new(key, b"", digestmod=hashlib.sha256).digest()).decode())
+        url += ("&" if "?" in url else "?") + "timestamp=%s&sign=%s" % (ts, sign)
+    return _post_json(url, {"msgtype": "markdown",
+                            "markdown": {"title": title,
+                                         "text": "### %s\n\n%s" % (title, _fmt_sections(sections))}},
+                      "钉钉")
+
+
+def push_serverchan(sendkey: str, title: str, sections: list[dict]) -> str:
+    """Server酱：推到你的微信（微信扫码关注「方糖」服务号即可拿 SendKey）。
+
+    对没有飞书/企业微信的人，这是最省事的一条——不用建群、不用装 App。
+    免费版每天有额度限制，日常只跑一两次完全够。
+    """
+    url = sendkey if sendkey.startswith("http") else "https://sctapi.ftqq.com/%s.send" % sendkey
+    return _post_json(url, {"title": title, "desp": _fmt_sections(sections)}, "Server酱")
+
+
+def push_pushplus(token: str, title: str, sections: list[dict]) -> str:
+    """PushPlus：也是推微信，扫码登录拿 token 即可，同样零门槛。"""
+    return _post_json("https://www.pushplus.plus/send",
+                      {"token": token, "title": title,
+                       "content": _fmt_sections(sections), "template": "markdown"},
+                      "PushPlus")
+
+
+def push_bark(key: str, title: str, sections: list[dict], server: str = "") -> str:
+    """Bark：iOS 推送（装个免费 App，拿到 key 就能收）。可自建服务器，用 BARK_URL 覆盖。"""
+    base = (server or "https://api.day.app").rstrip("/")
+    url = key if key.startswith("http") else "%s/%s" % (base, key.strip("/"))
+    return _post_json(url, {"title": title, "body": _fmt_sections(sections, md=False),
+                            "group": "Buddy加油站"}, "Bark")
+
+
+def push_ntfy(topic: str, title: str, sections: list[dict], server: str = "") -> str:
+    """ntfy：开源推送，手机装 App 订阅一个 topic 即可，不用注册。
+
+    topic 相当于密码——名字取得随机一点，别用 buddy-daily 这种能被猜到的。
+    """
+    base = (server or "https://ntfy.sh").rstrip("/")
+    url = topic if topic.startswith("http") else "%s/%s" % (base, topic.strip("/"))
+    body = "%s\n\n%s" % (title, _fmt_sections(sections, md=False))
+    # HTTP 头只能是 ASCII，所以 Title 用固定英文，中文标题放正文首行
+    return _post_raw(url, body.encode("utf-8"),
+                     {"Content-Type": "text/plain; charset=utf-8",
+                      "Title": "Buddy Gas Station Daily", "Tags": "cat"}, "ntfy")
+
+
+def push_telegram(bot_token: str, chat_id: str, title: str, sections: list[dict]) -> str:
+    """Telegram Bot。用纯文本（不带 parse_mode），避免内容里的特殊字符把消息卡住。"""
+    return _post_json("https://api.telegram.org/bot%s/sendMessage" % bot_token,
+                      {"chat_id": chat_id, "disable_web_page_preview": True,
+                       "text": "%s\n\n%s" % (title, _fmt_sections(sections, md=False))},
+                      "Telegram")
 
 
 def push_email(host: str, port: int, user: str, password: str, to: str,
                subject: str, text: str) -> str:
+    """SMTP 邮件。465 走 SSL，其他端口（587/25）走 STARTTLS。
+
+    最通用的一条：任何邮箱都行（QQ/163/Outlook/Gmail 都发「授权码」，不是登录密码）。
+    缺点是不即时——当兜底渠道用比较合适。
+    """
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = user
     msg["To"] = to
     msg.set_content(text)
-    with smtplib.SMTP_SSL(host, port, timeout=TIMEOUT) as s:
-        s.login(user, password)
-        s.send_message(msg)
+    if int(port) == 465:
+        with smtplib.SMTP_SSL(host, int(port), timeout=TIMEOUT) as s:
+            s.login(user, password)
+            refused = s.send_message(msg)
+    else:
+        with smtplib.SMTP(host, int(port), timeout=TIMEOUT) as s:
+            s.ehlo()
+            if s.has_extn("starttls"):
+                s.starttls(context=ssl.create_default_context())
+                s.ehlo()
+            s.login(user, password)
+            refused = s.send_message(msg)
+    # send_message 不抛异常也可能"部分被拒"，这里必须显式检查，否则就是静默丢信
+    if refused:
+        return "邮件部分被拒：%s" % refused
     return "邮件已发送"
 
 
+def _resp_verdict(raw: str) -> tuple[bool, str]:
+    """各家推送服务的成功判定收敛成一处。
+
+    飞书 `code=0`、企微/钉钉 `errcode=0`、Server酱 `code=0`、
+    PushPlus/Bark `code=200`、Telegram `ok=true`；ntfy 返回纯文本，HTTP 通了就算成。
+    """
+    try:
+        j = json.loads(raw)
+    except ValueError:
+        return True, ""
+    if not isinstance(j, dict):
+        return True, ""
+    for key, good in (("code", (0, 200)), ("errcode", (0,)),
+                      ("StatusCode", (0,)), ("status", (0,))):
+        if key in j:
+            try:
+                v = int(j[key])
+            except (TypeError, ValueError):
+                continue
+            if v not in good:
+                reason = (j.get("msg") or j.get("errmsg")
+                          or j.get("message") or j.get("error") or "")
+                return False, "code=%s%s" % (v, " " + str(reason) if reason else "")
+    if j.get("ok") is False:
+        return False, "ok=false %s" % (j.get("description") or "")
+    return True, ""
+
+
 def _post_json(url: str, payload: dict, label: str) -> str:
-    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
-                                 headers={"Content-Type": "application/json"}, method="POST")
+    # ensure_ascii=False：中文直出（RFC 8259 规定 JSON 就是 UTF-8），
+    # 报文体积小、抓包和日志里也直接看得懂。
+    return _post_raw(url, json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                     {"Content-Type": "application/json; charset=utf-8"}, label)
+
+
+def _post_raw(url: str, data: bytes, headers: dict, label: str) -> str:
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    code, out = -1, ""
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT,
                                     context=ssl.create_default_context()) as r:
+            code = r.status
             out = r.read().decode("utf-8", "replace")
-        if label == "飞书":
-            try:
-                j = json.loads(out)
-                if j.get("code") not in (0, None) or j.get("StatusCode") not in (0, None):
-                    return "%s推送失败：%s" % (label, out[:200])
-            except ValueError:
-                pass
-        return "%s推送成功" % label
+        LAST_TRACE.append({"label": label, "url": url, "http": code, "raw": out})
+    except urllib.error.HTTPError as e:
+        code = e.code
+        out = e.read().decode("utf-8", "replace")
+        LAST_TRACE.append({"label": label, "url": url, "http": code, "raw": out})
+        return "%s推送失败：HTTP %s %s" % (label, code, out[:200].strip())
     except Exception as e:  # noqa: BLE001
+        LAST_TRACE.append({"label": label, "url": url, "http": -1,
+                           "raw": "%s: %s" % (type(e).__name__, e)})
         return "%s推送失败：%s" % (label, e)
+    ok, why = _resp_verdict(out)
+    return ("%s推送成功" % label) if ok else ("%s推送失败：%s" % (label, why or out[:200]))
+
+
+def detect_channels() -> list[str]:
+    """决定这轮要发哪些渠道。
+
+    * 配了 NOTIFY_CHANNELS：按点名发（all = 所有已配置的渠道）；
+    * 没配：哪个渠道的 secret 配了就发哪个（配了几个发几个）。
+    """
+    def env(k: str) -> str:
+        return (os.environ.get(k) or "").strip()
+
+    available = set()
+    if env("FEISHU_WEBHOOK"):
+        available.add("feishu")
+    if env("WECOM_WEBHOOK"):
+        available.add("wecom")
+    if env("DINGTALK_WEBHOOK"):
+        available.add("dingtalk")
+    if env("SERVERCHAN_KEY") or env("SERVERCHAN_SENDKEY"):
+        available.add("serverchan")
+    if env("PUSHPLUS_TOKEN"):
+        available.add("pushplus")
+    if env("BARK_KEY") or env("BARK_URL"):
+        available.add("bark")
+    if env("NTFY_TOPIC"):
+        available.add("ntfy")
+    if env("TELEGRAM_BOT_TOKEN") and env("TELEGRAM_CHAT_ID"):
+        available.add("telegram")
+    if env("SMTP_HOST"):
+        available.add("email")
+
+    spec = env("NOTIFY_CHANNELS").lower().replace(";", ",")
+    if spec:
+        want = {c.strip() for c in spec.split(",") if c.strip()}
+        if "all" in want:
+            return [c for c in NOTIFY_ORDER if c in available]
+        return [c for c in NOTIFY_ORDER if c in want and c in available]
+    return [c for c in NOTIFY_ORDER if c in available]
+
+
+def _dispatch(ch: str, stamp: str, env: str, title: str,
+              sections: list[dict], ok: bool) -> str:
+    """把一份内容投给某个渠道。单个渠道炸了不影响其他渠道。"""
+    def e(k: str) -> str:
+        return (os.environ.get(k) or "").strip()
+
+    try:
+        if ch == "feishu":
+            return push_feishu(e("FEISHU_WEBHOOK"), stamp, env, sections, ok,
+                               os.environ.get("FEISHU_SECRET", ""))
+        if ch == "wecom":
+            return push_wecom(e("WECOM_WEBHOOK"), sections, title)
+        if ch == "dingtalk":
+            return push_dingtalk(e("DINGTALK_WEBHOOK"), sections, title, e("DINGTALK_SECRET"))
+        if ch == "serverchan":
+            return push_serverchan(e("SERVERCHAN_KEY") or e("SERVERCHAN_SENDKEY"),
+                                   title, sections)
+        if ch == "pushplus":
+            return push_pushplus(e("PUSHPLUS_TOKEN"), title, sections)
+        if ch == "bark":
+            return push_bark(e("BARK_KEY"), title, sections, e("BARK_URL"))
+        if ch == "ntfy":
+            return push_ntfy(e("NTFY_TOPIC"), title, sections, e("NTFY_URL"))
+        if ch == "telegram":
+            return push_telegram(e("TELEGRAM_BOT_TOKEN"), e("TELEGRAM_CHAT_ID"),
+                                 title, sections)
+        if ch == "email":
+            return push_email(e("SMTP_HOST"), int(e("SMTP_PORT") or "465"),
+                              e("SMTP_USER"), os.environ.get("SMTP_PASS") or "",
+                              e("MAIL_TO") or e("SMTP_USER"),
+                              "[Buddy加油站] %s · %s" % (stamp, env),
+                              "%s\n\n%s" % (title, _fmt_sections(sections, md=False)))
+    except Exception as ex:  # noqa: BLE001
+        return "%s推送失败：%s" % (CHANNEL_LABEL.get(ch, ch), ex)
+    return "%s：未知渠道（可选：%s）" % (ch, ", ".join(NOTIFY_ORDER))
 
 
 # ================= 单账号执行 =================
@@ -738,43 +990,33 @@ def _sections_of(results: list[dict]) -> list[dict]:
 
 
 def notify(results: list[dict], stamp: str, env: str) -> list[str]:
-    """推送。自带 webhook 的账号单独发，其余的汇总成一张卡片。"""
+    """推送。
+
+    * 账号自带 webhook 的：单独发给他自己的群（飞书），不混进大卡片；
+    * 其余的：按 detect_channels() 得出的渠道，每个渠道各发一份。
+
+    单个渠道失败只写进 notices，不影响退出码，也不影响别的渠道。
+    """
     notices: list[str] = []
     shared = [r for r in results if not r["_webhook"]]
     own = [r for r in results if r["_webhook"]]
+    title = "Buddy 加油站日报 · %s · %s" % (stamp, env)
 
-    global_wh = (os.environ.get("FEISHU_WEBHOOK") or "").strip()
-    global_secret = os.environ.get("FEISHU_SECRET", "")
-    if shared:
-        if global_wh:
-            ok = all(r["checkin_ok"] for r in shared)
-            notices.append(push_feishu(global_wh, stamp, env, _sections_of(shared),
-                                       ok, global_secret))
-        else:
-            notices.append("飞书：%d 个账号未配置 Webhook，已跳过" % len(shared))
-
+    # ① 账号专属群
     for r in own:
-        notice = push_feishu(r["_webhook"], stamp, env, _sections_of([r]),
-                             r["checkin_ok"], r["_secret"])
-        notices.append("%s：%s" % (r["name"], notice))
+        notices.append("%s：%s" % (r["name"], push_feishu(
+            r["_webhook"], stamp, env, _sections_of([r]), r["checkin_ok"], r["_secret"])))
 
-    ww = (os.environ.get("WECOM_WEBHOOK") or "").strip()
-    if ww:
-        notices.append(push_wecom(ww, _sections_of(results), "%s · %s" % (stamp, env)))
-
-    if os.environ.get("SMTP_HOST"):
-        try:
-            body = "\n\n".join(
-                "%s\n签到：%s\n猫猫：%s" % (r["name"], "\n".join(r["checkin"]["lines"]),
-                                          "\n".join(r["cat"]["lines"]))
-                for r in results)
-            notices.append(push_email(
-                os.environ["SMTP_HOST"], int(os.environ.get("SMTP_PORT", "465")),
-                os.environ["SMTP_USER"], os.environ["SMTP_PASS"],
-                os.environ.get("MAIL_TO", os.environ["SMTP_USER"]),
-                "[Buddy加油站] %s · %s" % (stamp, env), body))
-        except Exception as e:  # noqa: BLE001
-            notices.append("邮件推送失败：%s" % e)
+    # ② 全局渠道
+    if shared:
+        channels = detect_channels()
+        if not channels:
+            notices.append("未配置任何推送渠道，已跳过（见 README「通知渠道」一节）")
+        else:
+            secs = _sections_of(shared)
+            ok = all(r["checkin_ok"] for r in shared)
+            for ch in channels:
+                notices.append(_dispatch(ch, stamp, env, title, secs, ok))
 
     return notices
 

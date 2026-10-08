@@ -22,3 +22,8 @@ __pycache__/
 
 # 系统
 .DS_Store
+
+# IDE / 编辑器（不参与运行，别提交）
+.idea/
+.vscode/
+*.iml

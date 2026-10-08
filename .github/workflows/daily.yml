@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 签到 + 派猫猫，并推送飞书
+      - name: 签到 + 派猫猫，并推送通知
         env:
           # 多账号清单：JSON 数组，由本机刷新脚本注入（推荐）
           # [{"name":"我的账号","token":"...","uid":"...","domain":"www.workbuddy.cn"}]
@@ -34,15 +34,47 @@ jobs:
           WB_TOKEN: ${{ secrets.WB_TOKEN }}
           WB_UID: ${{ secrets.WB_UID }}
           WB_DOMAIN: ${{ secrets.WB_DOMAIN }}
-          # 飞书自定义机器人：Webhook 必填；开了签名校验才需要 FEISHU_SECRET
-          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           WB_ENV: prod
           # 可选：手动指定整轮时间预算（秒）。不设则按账号数自动算。
           # WB_BUDGET_SECONDS: "600"
           # 可选：有账号 token 过期时不希望整轮算失败，就打开这行，
           # 变成「至少一个账号签到成功即算成功」。
           # WB_ALLOW_PARTIAL: "1"
+
+          # ============ 通知渠道 ============
+          # 下面的渠道「配了哪个就发哪个」。全都不配也不会报错，只是不发通知。
+          # 配了多个会各发一份；只想发其中几个就点名，例如：
+          #   NOTIFY_CHANNELS: dingtalk,serverchan
+          #   NOTIFY_CHANNELS: all          # 所有已配置的渠道
+          NOTIFY_CHANNELS: ${{ secrets.NOTIFY_CHANNELS }}
+
+          # ① 飞书自定义机器人（Webhook 必填；开了签名校验才需要 _SECRET）
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+          # ② 企业微信群机器人（群设置 → 群机器人 → 添加，复制 Webhook）
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          # ③ 钉钉群机器人。安全设置务必选「加签」——
+          #    GitHub runner 出口 IP 是动态的，「IP 白名单」模式必然失败
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+          # ④ Server酱 / ⑤ PushPlus：都推微信，扫码即可，零门槛（没有飞书就用这俩）
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          # ⑥ Bark：iOS 推送（BARK_URL 用于自建服务器）
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+          BARK_URL: ${{ secrets.BARK_URL }}
+          # ⑦ ntfy：开源推送，手机装 App 订阅 topic 即可（NTFY_URL 用于自建服务器）
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          # ⑧ Telegram Bot
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # ⑨ 邮件（465 走 SSL，其他端口走 STARTTLS；密码填邮箱「授权码」）
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
         run: |
           set -euo pipefail
           # 解释器路径不写死版本号，动态取当前 runner 上的 python3
