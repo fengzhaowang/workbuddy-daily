@@ -1,22 +1,38 @@
 #!/usr/bin/env python3
-"""WorkBuddy「Buddy 加油站」每日一体化任务：先签到，再处理猫猫旅行。
+"""WorkBuddy「Buddy 加油站」每日一体化任务（多账号版）。
 
-一次跑完两件事：
+一次跑完所有账号，每个账号做两件事：
   1. 签到：先查活动状态，未签才领（幂等，重复跑不会多领）。
   2. 猫猫旅行：先领掉「已到家」那一趟的旅行积分，再判断今天还能不能派新的一趟；
      今天已经派过（daily_limit_reached）就不派。
-  3. 结果分「签到」「猫猫」两段推送飞书（可选企业微信 / 邮件）。
-  4. 猫猫整段被 try 兜住：它怎么炸都不改签到结论；签到成功即退出码 0。
 
-凭证只从环境变量读（GitHub Actions 由仓库 secret 注入）。
-本机调试时加 --local 才读本机登录态；明文 token 不打印、不落盘，所有输出经脱敏。
+结果推送飞书：默认所有账号汇总成**一张卡片**，每个账号一个分区、区内
+「🏠 签到」与「🐾 猫猫」分行写清；某个账号如果自带 webhook，则单独发给他自己的群。
+
+隔离层级（重要）：
+  * 账号之间互相隔离——A 的 token 过期不影响 B 照常签到；
+  * 账号内部，猫猫段被 try 兜住——它怎么炸都不改该账号的签到结论。
+
+退出码：所有账号签到成功 => 0；加 --allow-partial 则「至少一个成功」=> 0。
+猫猫段一律不影响退出码（需求：签到成功就算成功）。
+
+凭证来源（优先级从高到低）：
+  1. --local                  本机登录态（调试用，单账号）
+  2. --accounts <文件>         本机账号清单 JSON（调试多账号）
+  3. WB_ACCOUNTS              环境变量，JSON 数组（云端推荐）
+  4. WB_TOKEN / WB_UID        旧版单账号环境变量（向后兼容）
+
+明文 token 只从上述来源读入，不打印、不落盘；所有输出经脱敏。
 
 用法：
-  python3 scripts/daily.py                  # 云端：读 WB_TOKEN / WB_UID / WB_DOMAIN
-  python3 scripts/daily.py --local          # 本机：读本机登录态
-  python3 scripts/daily.py --local --raw    # 额外打印脱敏后的原始返回（验收用）
-  python3 scripts/daily.py --dry-run        # 只查状态，不做任何写操作
-  python3 scripts/daily.py --no-notify      # 不推送，只看结论
+  python3 scripts/daily.py                          # 云端：读 WB_ACCOUNTS
+  python3 scripts/daily.py --local                  # 本机单账号
+  python3 scripts/daily.py --accounts accounts.local.json   # 本机多账号
+  python3 scripts/daily.py --list-accounts          # 只列出识别到的账号（脱敏）
+  python3 scripts/daily.py --only "我的账号,小号"    # 只跑指定账号（名字或序号）
+  python3 scripts/daily.py --local --raw            # 附上脱敏后的原始返回
+  python3 scripts/daily.py --dry-run                # 只查状态，不做写操作
+  python3 scripts/daily.py --no-notify              # 不推送，只看结论
 """
 
 from __future__ import annotations
@@ -32,6 +48,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, field
 from email.message import EmailMessage
 from typing import Any, Optional
 
@@ -49,8 +66,11 @@ SERVER_RETRY_DELAYS = (3, 10)
 
 # 整轮时间预算：留足余量，保证「推送飞书」这一步一定能执行到。
 # 否则 Actions 的 timeout-minutes 把进程强杀，连通知都发不出去。
-RUN_BUDGET_SECONDS = int(os.environ.get("WB_BUDGET_SECONDS", "420"))
+# 账号数越多预算越大（每个账号最坏要走 6 个请求）。
+BUDGET_BASE_SECONDS = 420.0
+BUDGET_PER_EXTRA_ACCOUNT = 150.0
 _started_at = time.monotonic()
+_BUDGET: float = float(os.environ.get("WB_BUDGET_SECONDS") or BUDGET_BASE_SECONDS)
 
 # ---------- 接口路径：全部与客户端实际请求核对通过 ----------
 # 每个路径都用真实请求验证过「存在且语义正确」，不是网上抄的旧名字。
@@ -59,7 +79,7 @@ P_CHECKIN_STATUS = "/v2/billing/meter/checkin-activity-status"   # POST {} -> �
 P_CHECKIN_CLAIM = "/v2/billing/meter/daily-checkin"              # POST {} -> 领签到积分
 P_TRAVEL_STATUS = "/v2/activity/growth/buddy/travel/status"      # GET      -> 旅行状态
 P_TRAVEL_CONFIG = "/v2/activity/growth/buddy/travel/config"      # GET      -> 可选目的地
-P_TRAVEL_CLAIM = "/v2/activity/growth/buddy/travel/claim"        # POST {} -> 领到家积分
+P_TRAVEL_CLAIM = "/v2/activity/growth/buddy/travel/claim"        # POST {record_id}
 P_TRAVEL_DEPART = "/v2/activity/growth/buddy/travel/depart"      # POST {location_id}
 P_BUDDY_INFO = "/v2/activity/growth/buddy/info"                  # GET      -> 猫咪资料
 
@@ -121,6 +141,123 @@ def is_ok(code: int, body: Any) -> bool:
     return 200 <= code < 300 and isinstance(body, dict) and body.get("code") == 0
 
 
+# ================= 账号清单 =================
+# 兼容多种字段写法，尽量让人少踩坑：token/access_token、uid/user_id……
+_FIELD_ALIASES = {
+    "name": ("name", "alias", "label", "账号", "备注"),
+    "token": ("token", "access_token", "accessToken", "wb_token"),
+    "uid": ("uid", "user_id", "userId", "wb_uid"),
+    "domain": ("domain", "wb_domain"),
+    "endpoint": ("endpoint", "base_url", "baseUrl"),
+    "webhook": ("webhook", "feishu_webhook", "feishuWebhook"),
+    "secret": ("secret", "feishu_secret", "feishuSecret"),
+}
+
+
+@dataclass
+class Account:
+    name: str
+    token: str
+    uid: str = ""
+    domain: str = ""
+    endpoint: str = ENDPOINT_DEFAULT
+    webhook: str = ""      # 该账号专属飞书机器人（留空则并入汇总卡片）
+    secret: str = ""       # 专属机器人开了签名校验时才需要
+
+
+def _pick(raw: dict, key: str) -> str:
+    for alias in _FIELD_ALIASES[key]:
+        v = raw.get(alias)
+        if v not in (None, ""):
+            return str(v).strip()
+    return ""
+
+
+def _to_account(raw: Any, index: int, endpoint_env: str) -> Account:
+    if not isinstance(raw, dict):
+        raise ValueError("账号清单第 %d 项不是对象" % index)
+    token = _pick(raw, "token")
+    if not token:
+        raise ValueError("账号清单第 %d 项缺少 token" % index)
+    return Account(
+        name=_pick(raw, "name") or "账号%d" % index,
+        token=token,
+        uid=_pick(raw, "uid"),
+        domain=_pick(raw, "domain"),
+        endpoint=_pick(raw, "endpoint") or endpoint_env,
+        webhook=_pick(raw, "webhook"),
+        secret=_pick(raw, "secret"),
+    )
+
+
+def _parse_accounts(raw: Any, endpoint_env: str) -> list[Account]:
+    items = raw.get("accounts") if isinstance(raw, dict) else raw
+    if not isinstance(items, list) or not items:
+        raise ValueError("账号清单为空，或格式不对（应为 JSON 数组，或 {\"accounts\": [...]}）")
+    return [_to_account(it, i, endpoint_env) for i, it in enumerate(items, 1)]
+
+
+def _load_accounts(args: argparse.Namespace) -> list[Account]:
+    endpoint_env = os.environ.get("WB_ENDPOINT", ENDPOINT_DEFAULT)
+
+    if args.local:
+        import wb_auth
+        c = wb_auth.load_credentials()
+        return [Account(name=args.as_name or "本机账号", token=c["token"], uid=c["uid"],
+                        domain=c.get("domain", ""),
+                        endpoint=c.get("endpoint") or endpoint_env)]
+
+    if args.accounts:
+        with open(args.accounts, encoding="utf-8") as fp:
+            return _parse_accounts(json.load(fp), endpoint_env)
+
+    env_json = (os.environ.get("WB_ACCOUNTS") or "").strip()
+    if env_json:
+        return _parse_accounts(json.loads(env_json), endpoint_env)
+
+    # ---- 旧版单账号环境变量：继续支持，别让已有的 secret 失效 ----
+    token = (os.environ.get("WB_TOKEN") or "").strip()
+    if token:
+        return [Account(name=os.environ.get("WB_ACCOUNT_NAME") or "默认账号",
+                        token=token, uid=(os.environ.get("WB_UID") or "").strip(),
+                        domain=os.environ.get("WB_DOMAIN", ""),
+                        endpoint=endpoint_env)]
+
+    raise RuntimeError(
+        "未识别到任何账号。推荐设置 WB_ACCOUNTS（JSON 数组）；"
+        "也兼容旧的 WB_TOKEN / WB_UID 单账号写法")
+
+
+def _select(accounts: list[Account], spec: str) -> list[Account]:
+    """按名字或序号筛选，支持逗号分隔。"""
+    wanted = [s.strip() for s in spec.split(",") if s.strip()]
+    picked, missed = [], []
+    for w in wanted:
+        hit = None
+        for i, a in enumerate(accounts, 1):
+            if w == str(i) or w == a.name:
+                hit = a
+                break
+        if hit is None:
+            missed.append(w)
+        elif hit not in picked:
+            picked.append(hit)
+    if missed:
+        raise ValueError("--only 里这些账号找不到：%s（可选：%s）"
+                         % ("、".join(missed), "、".join(a.name for a in accounts)))
+    return picked
+
+
+def public_account(a: Account) -> dict:
+    """给日志/JSON 用的脱敏视图。"""
+    out = {"name": a.name, "uid": redact(a.uid), "token": redact(a.token),
+           "domain": a.domain or "-", "endpoint": a.endpoint}
+    if a.webhook:
+        out["webhook"] = "专属（已配置）"
+    return out
+
+
+# ================= HTTP =================
 class Api:
     """极薄 HTTP 客户端，记录每次调用以便脱敏回放。"""
 
@@ -189,8 +326,17 @@ def _retry_delays(code: int) -> tuple:
     return ()                      # 2xx / 4xx / 401 / 403
 
 
+def set_budget(seconds: float) -> None:
+    global _BUDGET
+    _BUDGET = float(seconds)
+
+
+def default_budget(account_count: int) -> float:
+    return BUDGET_BASE_SECONDS + BUDGET_PER_EXTRA_ACCOUNT * max(0, account_count - 1)
+
+
 def _budget_left() -> float:
-    return RUN_BUDGET_SECONDS - (time.monotonic() - _started_at)
+    return _BUDGET - (time.monotonic() - _started_at)
 
 
 def _req_timeout() -> float:
@@ -229,7 +375,7 @@ def do_checkin(api: Api, dry_run: bool = False) -> dict:
                 "lines": ["❌ 网络不可达，未拿到签到状态（%s）" % body.get("error", "")]}
     if code in (401, 403):
         return {"ok": False, "segment": "签到", "result": "AUTH",
-                "lines": ["❌ 鉴权失败（HTTP %s）：secret 里的 token 可能已过期，"
+                "lines": ["❌ 鉴权失败（HTTP %s）：该账号的 token 可能已过期，"
                           "请在本机重跑刷新脚本导出新 token" % code]}
     if not is_ok(code, body):
         return {"ok": False, "segment": "签到", "result": "ERROR",
@@ -458,23 +604,44 @@ def _buddy_name(api: Api) -> str:
 
 
 # ================= 推送 =================
-def push_feishu(webhook: str, title: str, checkin: str, cat: str, env: str,
-                ok: bool, secret: str = "") -> str:
-    """飞书自定义机器人：一张卡片，签到与猫猫分两个分区写清楚。"""
+NOTE_TEXT = "各账号互相隔离 · 猫猫段失败不影响该账号签到结论 · 由 GitHub Actions 定时执行"
+
+
+def _lines_to_md(lines: list[str]) -> str:
+    return "\n".join(l for l in lines if l).strip() or "（无输出）"
+
+
+def build_feishu_card(stamp: str, env: str, sections: list[dict],
+                      ok: bool, secret: str = "") -> dict:
+    """构造飞书自定义机器人的交互卡片。
+
+    多账号：每个账号一个分区，分区内「🏠 签到」「🐾 猫猫」分行写清；
+    单账号时 structure 一样，只是只有一个分区。
+
+    单独抽出来是为了让自检脚本（scripts/test_feishu.py）用**同一个**构造函数，
+    避免「自检能通、线上不通」这种最难查的偏差。
+
+    sections: [{"name": str, "checkin": [lines], "cat": [lines]}, ...]
+    """
+    elements: list[dict] = []
+    multi = len(sections) > 1
+    for i, s in enumerate(sections):
+        if i:
+            elements.append({"tag": "hr"})
+        head = "**%d. %s**" % (i + 1, s["name"]) if multi else "**%s**" % s["name"]
+        content = "%s\n🏠 **签到**\n%s\n🐾 **猫猫**\n%s" % (
+            head, _lines_to_md(s.get("checkin") or []), _lines_to_md(s.get("cat") or []))
+        elements.append({"tag": "div", "fields": [
+            {"is_short": False, "text": {"tag": "lark_md", "content": content}}]})
+    elements.append({"tag": "note", "elements": [
+        {"tag": "plain_text", "content": NOTE_TEXT}]})
+
     card = {
         "config": {"wide_screen_mode": True},
         "header": {"template": "green" if ok else "orange",
                    "title": {"tag": "plain_text",
-                             "content": "Buddy 加油站日报 · %s · %s" % (title, env)}},
-        "elements": [
-            {"tag": "div", "fields": [{"is_short": False, "text": {
-                "tag": "lark_md", "content": "**🏠 加油站签到**\n%s" % checkin}}]},
-            {"tag": "hr"},
-            {"tag": "div", "fields": [{"is_short": False, "text": {
-                "tag": "lark_md", "content": "**🐾 猫猫旅行**\n%s" % cat}}]},
-            {"tag": "note", "elements": [{"tag": "plain_text",
-                                          "content": "猫猫段失败不影响签到结论 · 由 GitHub Actions 定时执行"}]},
-        ],
+                             "content": "Buddy 加油站日报 · %s · %s" % (stamp, env)}},
+        "elements": elements,
     }
     payload: dict = {"msg_type": "interactive", "card": card}
     if secret:
@@ -486,12 +653,23 @@ def push_feishu(webhook: str, title: str, checkin: str, cat: str, env: str,
         payload["timestamp"] = ts
         payload["sign"] = base64.b64encode(
             hmac.new(key, b"", digestmod=hashlib.sha256).digest()).decode()
-    return _post_json(webhook, payload, "飞书")
+    return payload
 
 
-def push_wecom(webhook: str, checkin: str, cat: str, title: str) -> str:
-    md = ("**%s**\n\n**🏠 加油站签到**\n%s\n\n**🐾 猫猫旅行**\n%s" % (title, checkin, cat))
-    return _post_json(webhook, {"msgtype": "markdown", "markdown": {"content": md}}, "企业微信")
+def push_feishu(webhook: str, stamp: str, env: str, sections: list[dict],
+                ok: bool, secret: str = "") -> str:
+    """飞书自定义机器人：一张卡片，账号分区、签到与猫猫分行写清。"""
+    return _post_json(webhook, build_feishu_card(stamp, env, sections, ok, secret), "飞书")
+
+
+def push_wecom(webhook: str, sections: list[dict], title: str) -> str:
+    blocks = "\n\n".join(
+        "**%s**\n\n**🏠 加油站签到**\n%s\n\n**🐾 猫猫旅行**\n%s"
+        % (s["name"], _lines_to_md(s.get("checkin") or []), _lines_to_md(s.get("cat") or []))
+        for s in sections)
+    return _post_json(webhook, {"msgtype": "markdown",
+                                "markdown": {"content": "**%s**\n\n%s" % (title, blocks)}},
+                      "企业微信")
 
 
 def push_email(host: str, port: int, user: str, password: str, to: str,
@@ -526,87 +704,175 @@ def _post_json(url: str, payload: dict, label: str) -> str:
         return "%s推送失败：%s" % (label, e)
 
 
-# ================= 主流程 =================
-def _load_credentials(local: bool) -> tuple[str, str, str, str]:
-    endpoint = os.environ.get("WB_ENDPOINT", ENDPOINT_DEFAULT)
-    if local:
-        import wb_auth
-        c = wb_auth.load_credentials()
-        return c["token"], c["uid"], c.get("domain", ""), c.get("endpoint") or endpoint
-    token = (os.environ.get("WB_TOKEN") or "").strip()
-    uid = (os.environ.get("WB_UID") or "").strip()
-    if not token:
-        raise RuntimeError("环境变量 WB_TOKEN 未设置（云端应由仓库 secret 注入）")
-    return token, uid, os.environ.get("WB_DOMAIN", ""), endpoint
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Buddy 加油站每日签到 + 派猫")
-    ap.add_argument("--local", action="store_true", help="从本机登录态取凭证（调试用）")
-    ap.add_argument("--dry-run", action="store_true", help="只查状态，不做写操作")
-    ap.add_argument("--raw", action="store_true", help="打印脱敏后的原始返回")
-    ap.add_argument("--no-notify", action="store_true", help="不推送，只看结论")
-    args = ap.parse_args()
-
-    try:
-        token, uid, domain, endpoint = _load_credentials(args.local)
-    except Exception as e:  # noqa: BLE001
-        print(json.dumps({"ok": False, "result": "NO_CREDENTIAL",
-                          "report": "未取得凭证：%s" % e}, ensure_ascii=False))
-        return 3
-
-    print("[cred] token=%s uid=%s domain=%s endpoint=%s"
-          % (redact(token), redact(uid), domain or "-", endpoint), file=sys.stderr)
-
-    api = Api(endpoint, token, uid, domain)
-    checkin = do_checkin(api, args.dry_run)
-    cat = do_cat(api, args.dry_run)          # 独立 try，炸了也只影响本段
-
-    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime())
-    env_name = os.environ.get("WB_ENV", "prod")
-    title = "签到成功" if checkin["ok"] else "签到需关注"
-
-    body = {
-        "ok": checkin["ok"],
+# ================= 单账号执行 =================
+def run_one(acc: Account, dry_run: bool = False) -> dict:
+    """跑一个账号。返回的 dict 里下划线开头的键是内部字段，不对外输出。"""
+    api = Api(acc.endpoint, acc.token, acc.uid, acc.domain)
+    checkin = do_checkin(api, dry_run)
+    cat = do_cat(api, dry_run)          # 独立 try，炸了也只影响本段
+    return {
+        "name": acc.name,
+        "uid": redact(acc.uid),
         "checkin_ok": checkin["ok"],
         "cat_ok": cat["ok"],
         "checkin": checkin,
         "cat": cat,
+        "_trace": api.trace,
+        "_webhook": acc.webhook,
+        "_secret": acc.secret,
+    }
+
+
+def _public(obj: Any) -> Any:
+    """去掉内部字段（含专属 webhook / 签名密钥）。"""
+    if isinstance(obj, dict):
+        return {k: _public(v) for k, v in obj.items() if not k.startswith("_")}
+    if isinstance(obj, list):
+        return [_public(v) for v in obj]
+    return obj
+
+
+def _sections_of(results: list[dict]) -> list[dict]:
+    return [{"name": r["name"], "checkin": r["checkin"]["lines"],
+             "cat": r["cat"]["lines"]} for r in results]
+
+
+def notify(results: list[dict], stamp: str, env: str) -> list[str]:
+    """推送。自带 webhook 的账号单独发，其余的汇总成一张卡片。"""
+    notices: list[str] = []
+    shared = [r for r in results if not r["_webhook"]]
+    own = [r for r in results if r["_webhook"]]
+
+    global_wh = (os.environ.get("FEISHU_WEBHOOK") or "").strip()
+    global_secret = os.environ.get("FEISHU_SECRET", "")
+    if shared:
+        if global_wh:
+            ok = all(r["checkin_ok"] for r in shared)
+            notices.append(push_feishu(global_wh, stamp, env, _sections_of(shared),
+                                       ok, global_secret))
+        else:
+            notices.append("飞书：%d 个账号未配置 Webhook，已跳过" % len(shared))
+
+    for r in own:
+        notice = push_feishu(r["_webhook"], stamp, env, _sections_of([r]),
+                             r["checkin_ok"], r["_secret"])
+        notices.append("%s：%s" % (r["name"], notice))
+
+    ww = (os.environ.get("WECOM_WEBHOOK") or "").strip()
+    if ww:
+        notices.append(push_wecom(ww, _sections_of(results), "%s · %s" % (stamp, env)))
+
+    if os.environ.get("SMTP_HOST"):
+        try:
+            body = "\n\n".join(
+                "%s\n签到：%s\n猫猫：%s" % (r["name"], "\n".join(r["checkin"]["lines"]),
+                                          "\n".join(r["cat"]["lines"]))
+                for r in results)
+            notices.append(push_email(
+                os.environ["SMTP_HOST"], int(os.environ.get("SMTP_PORT", "465")),
+                os.environ["SMTP_USER"], os.environ["SMTP_PASS"],
+                os.environ.get("MAIL_TO", os.environ["SMTP_USER"]),
+                "[Buddy加油站] %s · %s" % (stamp, env), body))
+        except Exception as e:  # noqa: BLE001
+            notices.append("邮件推送失败：%s" % e)
+
+    return notices
+
+
+# ================= 主流程 =================
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Buddy 加油站每日签到 + 派猫（多账号）")
+    ap.add_argument("--local", action="store_true", help="从本机登录态取凭证（单账号，调试用）")
+    ap.add_argument("--as", dest="as_name", help="配合 --local：给本机账号起个名字")
+    ap.add_argument("--accounts", help="本机账号清单 JSON 文件（多账号调试）")
+    ap.add_argument("--only", help="只跑指定账号（名字或序号，逗号分隔）")
+    ap.add_argument("--list-accounts", action="store_true", help="只列出识别到的账号（脱敏）后退出")
+    ap.add_argument("--dry-run", action="store_true", help="只查状态，不做写操作")
+    ap.add_argument("--raw", action="store_true", help="附上脱敏后的原始返回")
+    ap.add_argument("--no-notify", action="store_true", help="不推送，只看结论")
+    ap.add_argument("--allow-partial", action="store_true",
+                    help="只要有任意一个账号签到成功就返回 0（默认要求全部成功）")
+    args = ap.parse_args()
+
+    # 也认环境变量，方便在 workflow 里开关，不用改命令行
+    allow_partial = args.allow_partial or (
+        (os.environ.get("WB_ALLOW_PARTIAL") or "").strip().lower() in ("1", "true", "yes", "on"))
+
+    try:
+        accounts = _load_accounts(args)
+        if args.only:
+            accounts = _select(accounts, args.only)
+    except Exception as e:  # noqa: BLE001
+        print(json.dumps({"ok": False, "result": "NO_CREDENTIAL",
+                          "report": "账号清单不可用：%s" % e}, ensure_ascii=False))
+        return 3
+
+    if not accounts:
+        print(json.dumps({"ok": False, "result": "NO_ACCOUNT",
+                          "report": "筛选后没有可执行的账号"}, ensure_ascii=False))
+        return 3
+
+    if not os.environ.get("WB_BUDGET_SECONDS"):
+        set_budget(default_budget(len(accounts)))
+
+    if args.list_accounts:
+        print(json.dumps({"ok": True, "count": len(accounts),
+                          "budget_seconds": int(_BUDGET),
+                          "accounts": [public_account(a) for a in accounts]},
+                         ensure_ascii=False, indent=2))
+        return 0
+
+    print("[cred] 共 %d 个账号，预算 %.0fs" % (len(accounts), _BUDGET), file=sys.stderr)
+    for a in accounts:
+        print("  - %s  uid=%s  token=%s  %s"
+              % (a.name, redact(a.uid), redact(a.token), a.endpoint), file=sys.stderr)
+
+    results: list[dict] = []
+    for a in accounts:
+        if _budget_left() <= 1:
+            results.append({
+                "name": a.name, "uid": redact(a.uid), "checkin_ok": False, "cat_ok": False,
+                "checkin": {"ok": False, "segment": "签到", "result": "SKIPPED",
+                            "lines": ["⏱ 时间预算已耗尽，本账号本轮跳过（下轮会自动补上）"]},
+                "cat": {"ok": False, "segment": "猫猫旅行", "result": "SKIPPED",
+                        "lines": ["⏱ 时间预算已耗尽，本段跳过"]},
+                "_trace": [], "_webhook": a.webhook, "_secret": a.secret})
+            continue
+        results.append(run_one(a, args.dry_run))
+
+    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime())
+    env_name = os.environ.get("WB_ENV", "prod")
+
+    checkin_oks = [r["checkin_ok"] for r in results]
+    ok = any(checkin_oks) if allow_partial else all(checkin_oks)
+    n_ok = sum(1 for x in checkin_oks if x)
+
+    body = {
+        "ok": ok,
         "timestamp": stamp,
+        "env": env_name,
+        "mode": "partial" if allow_partial else "all",
+        "summary": {
+            "total": len(results),
+            "checkin_ok": n_ok,
+            "cat_ok": sum(1 for r in results if r["cat_ok"]),
+            "failed": [r["name"] for r in results if not r["checkin_ok"]],
+        },
+        "accounts": _public(results),
     }
     if args.raw:
-        body["raw"] = api.trace
+        for pub, raw in zip(body["accounts"], results):
+            pub["raw"] = raw["_trace"]
 
-    if not args.no_notify:
-        notices = []
-        fw = os.environ.get("FEISHU_WEBHOOK")
-        if fw:
-            notices.append(push_feishu(fw, title, "\n".join(checkin["lines"]),
-                                       "\n".join(cat["lines"]), env_name,
-                                       checkin["ok"], os.environ.get("FEISHU_SECRET", "")))
-        ww = os.environ.get("WECOM_WEBHOOK")
-        if ww:
-            notices.append(push_wecom(ww, "\n".join(checkin["lines"]),
-                                      "\n".join(cat["lines"]), "%s · %s" % (title, stamp)))
-        if os.environ.get("SMTP_HOST"):
-            try:
-                notices.append(push_email(
-                    os.environ["SMTP_HOST"], int(os.environ.get("SMTP_PORT", "465")),
-                    os.environ["SMTP_USER"], os.environ["SMTP_PASS"],
-                    os.environ.get("MAIL_TO", os.environ["SMTP_USER"]),
-                    "[Buddy加油站] %s · %s" % (title, stamp),
-                    "签到：%s\n\n猫猫：%s" % ("\n".join(checkin["lines"]),
-                                              "\n".join(cat["lines"]))))
-            except Exception as e:  # noqa: BLE001
-                notices.append("邮件推送失败：%s" % e)
-        body["notices"] = notices
-    else:
+    if args.no_notify:
         body["notices"] = ["(--no-notify：已跳过推送)"]
+    else:
+        body["notices"] = notify(results, stamp, env_name)
 
     print(json.dumps(body, ensure_ascii=False, indent=2))
 
     # 需求 4：签到成功就算成功，猫猫失败不改退出码
-    return 0 if checkin["ok"] else 1
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

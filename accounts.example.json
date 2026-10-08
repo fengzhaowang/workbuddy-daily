@@ -1,0 +1,25 @@
+{
+  "_说明": "示例文件，仅用于说明格式，可以直接提交进仓库。真实清单由 scripts/export_token.py 生成到 accounts.local.json（已在 .gitignore 里，权限 600）。",
+  "accounts": [
+    {
+      "name": "我",
+      "token": "这里填该账号的 accessToken（由 export_token.py 自动写入，别手抄）",
+      "uid": "该账号的 user id，接口要的 X-User-Id",
+      "domain": "www.workbuddy.cn"
+    },
+    {
+      "name": "小号",
+      "token": "同上",
+      "uid": "同上",
+      "domain": "www.workbuddy.cn"
+    },
+    {
+      "name": "同事A（结果单独发他自己的群）",
+      "token": "同上",
+      "uid": "同上",
+      "domain": "www.workbuddy.cn",
+      "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/换成他自己的机器人地址",
+      "secret": "只有该机器人开了「签名校验」时才需要填"
+    }
+  ]
+}

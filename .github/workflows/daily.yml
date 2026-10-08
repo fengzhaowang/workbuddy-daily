@@ -1,6 +1,6 @@
 name: Buddy 加油站每日任务
 
-# 每天定时跑一次，一次把「签到」和「派猫猫旅行」都做掉。
+# 每天定时跑一次，一次把「签到」和「派猫猫旅行」都做掉（多账号）。
 # cron 用 UTC：下面这行 = 北京时间每天 00:20 执行。
 # 想改时间就改 cron，注意换算：北京时间 = UTC + 8。
 on:
@@ -19,13 +19,18 @@ concurrency:
 jobs:
   daily:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 时间预算随账号数放大（脚本内 WB_BUDGET_SECONDS），这里留足余量。
+    # 账号特别多时（比如 10 个以上）相应调大，或把账号拆成多个 workflow。
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
       - name: 签到 + 派猫猫，并推送飞书
         env:
-          # 凭证由本机刷新脚本 scripts/export_token.py 注入仓库 secret
+          # 多账号清单：JSON 数组，由本机刷新脚本注入（推荐）
+          # [{"name":"我的账号","token":"...","uid":"...","domain":"www.workbuddy.cn"}]
+          WB_ACCOUNTS: ${{ secrets.WB_ACCOUNTS }}
+          # 旧版单账号 secret，仍兼容；配了 WB_ACCOUNTS 时以清单为准
           WB_TOKEN: ${{ secrets.WB_TOKEN }}
           WB_UID: ${{ secrets.WB_UID }}
           WB_DOMAIN: ${{ secrets.WB_DOMAIN }}
@@ -33,6 +38,11 @@ jobs:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
           WB_ENV: prod
+          # 可选：手动指定整轮时间预算（秒）。不设则按账号数自动算。
+          # WB_BUDGET_SECONDS: "600"
+          # 可选：有账号 token 过期时不希望整轮算失败，就打开这行，
+          # 变成「至少一个账号签到成功即算成功」。
+          # WB_ALLOW_PARTIAL: "1"
         run: |
           set -euo pipefail
           # 解释器路径不写死版本号，动态取当前 runner 上的 python3

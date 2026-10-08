@@ -10,6 +10,11 @@ auth/
 .env
 .env.*
 
+# 多账号清单：里面有明文 token，只在本地留（权限 600）
+accounts.local.json
+*.local.json
+!accounts.example.json
+
 # 调试用临时目录
 wb-probe/
 __pycache__/
