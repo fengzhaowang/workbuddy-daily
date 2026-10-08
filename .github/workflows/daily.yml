@@ -32,6 +32,14 @@ jobs:
         with:
           fetch-depth: 1
 
+      # 「跑的是旧 commit」已经坑过两次：清单里配了新字段，代码却还是旧的，
+      # 新字段被静默忽略，人只能对着「我明明配了怎么没生效」发懵。
+      # 把提交号打进日志，一眼就能对照。
+      - name: 记录本次运行的提交
+        run: |
+          echo "本次运行提交：${GITHUB_SHA}"
+          git log -1 --format='  %h %ad %s' --date=short
+
       - name: 签到 + 派猫猫，并推送通知
         env:
           # 多账号清单：JSON 数组，由本机刷新脚本注入（推荐）
