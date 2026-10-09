@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -270,6 +272,114 @@ def main() -> int:
 
         TRAVEL["state"], TRAVEL["record_id"] = "idle", None
         os.environ.pop("WB_ACCOUNTS", None)
+
+        print("⑧ 定时档位：cron 与档位表必须对得上（防「改了 cron 忘了改档位」）")
+        root = os.path.dirname(os.path.dirname(os.path.abspath(daily.__file__)))
+        with open(os.path.join(root, ".github/workflows/daily.yml"), encoding="utf-8") as fp:
+            wf_text = fp.read()
+        crons = re.findall(r'cron:\s*"([^"]+)"', wf_text)
+        ok &= check("能从 workflow 里读出 cron 列表", len(crons) >= 2, str(crons))
+        missing = [c for c in crons if c not in daily.SCHEDULE_MODES]
+        ok &= check("每条 cron 都在 SCHEDULE_MODES 里（漏了就会把收猫档当整轮跑）",
+                    not missing, str(missing))
+        stale = [c for c in daily.SCHEDULE_MODES if c not in crons]
+        ok &= check("SCHEDULE_MODES 里没有 workflow 已删掉的 cron",
+                    not stale, str(stale))
+        ok &= check("workflow 不再自带一份 cron->模式 映射（只留脚本里一处真相）",
+                    'case "${TRIGGER_CRON' not in wf_text and 'MODE="cat"' not in wf_text
+                    and "--mode" in wf_text and "TRIGGER_CRON:" in wf_text, "")
+
+        print("⑨ 延迟自证：GitHub 的 cron 晚多久，要算得出来、说得明白")
+        # 算例就是本次线上事故：计划北京 00:20，实际北京 05:21 才触发
+        rep = daily.cron_report("20 16 * * *", datetime(2026, 10, 8, 21, 21, tzinfo=timezone.utc))
+        ok &= check("算得出计划时刻（北京 00:20）",
+                    rep["planned_utc"] == "10-08 16:20" and rep["planned_local"] == "10-09 00:20",
+                    json.dumps(rep, ensure_ascii=False))
+        ok &= check("算得出实际时刻（北京 05:21）", rep["actual_local"] == "10-09 05:21",
+                    str(rep["actual_local"]))
+        ok &= check("延迟 = 301 分钟", rep["delay_minutes"] == 301, str(rep["delay_minutes"]))
+        note = daily.late_note(rep)
+        ok &= check("延迟说明点明「GitHub 定时器」与两个时刻",
+                    "GitHub" in note and "00:20" in note and "05:21" in note
+                    and "5 小时 1 分" in note, note)
+        ontime = daily.cron_report("20 16 * * *", datetime(2026, 10, 8, 16, 20, tzinfo=timezone.utc))
+        ok &= check("准点时不产生说明（不打扰人）",
+                    ontime["delay_minutes"] == 0 and daily.late_note(ontime) == "",
+                    str(ontime["delay_minutes"]))
+        ok &= check("认不出的 cron：报警，且按整轮跑（安全的一边）",
+                    "不在已知列表" in (daily.cron_report("30 3 * * 1").get("warning") or "")
+                    and daily.cron_report("30 3 * * 1").get("plan") is None, "")
+        ok &= check("手动触发（无 cron）不报「延迟」",
+                    daily.cron_report("")["delay_minutes"] is None
+                    and "手动触发" in daily.cron_report("")["reason"], "")
+
+        print("⑩ 延迟说明要进推送正文，且不许打乱账号编号")
+        one = [{"name": "癸", "checkin_ok": True, "cat_ok": True,
+                "checkin": {"lines": ["✅ 已签"]}, "cat": {"lines": ["🐾 在路上"]},
+                "_notify": {}, "_declared_notify": False, "_notify_problems": []}]
+        os.environ["SERVERCHAN_KEY"] = base + "/push/sct2"
+        SEEN.clear()
+        daily.notify(one, "2026-01-01 00:00", "test", note="⏱ 说明占位")
+        pushed = bodies("/push/sct2")
+        ok &= check("说明出现在推送正文里",
+                    len(pushed) == 1 and "⏱ 说明占位" in pushed[0], str(pushed)[:200])
+        ok &= check("单账号 + 一行说明，不该被编号成「1. 癸」",
+                    "1. 癸" not in (pushed[0] if pushed else ""),
+                    (pushed[0] if pushed else "")[:120])
+        card = json.dumps(daily.build_feishu_card(
+            "t", "e", daily._sections_of(one, "⏱ 说明占位"), True), ensure_ascii=False)
+        ok &= check("飞书卡片同样带说明、同样不编号",
+                    "⏱ 说明占位" in card and "1. 癸" not in card and "🏠 **签到**" in card, "")
+        os.environ.pop("SERVERCHAN_KEY", None)
+        SEEN.clear()
+
+        print("⑪ 档位判定真的接上了命令行（TRIGGER_CRON -> 跑哪一段）")
+        os.environ["WB_ACCOUNTS"] = json.dumps({"accounts": [
+            {"name": "癸", "token": "t10", "uid": "u10", "endpoint": base,
+             "notify": {"wecom": base + "/push/gui"}}]}, ensure_ascii=False)
+        TRAVEL["state"], TRAVEL["record_id"] = "traveling", None
+
+        SEEN.clear()
+        os.environ["TRIGGER_CRON"] = "20 22,4,10 * * *"
+        body = run_cli(["--mode", "auto"])
+        touched = {s["path"].split("?")[0] for s in SEEN}
+        ok &= check("收猫档的 cron -> segment=cat，且完全不碰签到接口",
+                    body["json"].get("segment") == "cat"
+                    and daily.P_CHECKIN_STATUS not in touched
+                    and daily.P_CHECKIN_CLAIM not in touched, str(sorted(touched)))
+
+        SEEN.clear()
+        os.environ["TRIGGER_CRON"] = "20 16 * * *"
+        body = run_cli(["--mode", "auto"])
+        touched = {s["path"].split("?")[0] for s in SEEN}
+        ok &= check("整轮档的 cron -> segment=all，会碰签到接口",
+                    body["json"].get("segment") == "all"
+                    and daily.P_CHECKIN_STATUS in touched, str(sorted(touched)))
+
+        SEEN.clear()
+        os.environ["TRIGGER_CRON"] = "7 7 * * *"
+        body = run_cli(["--mode", "auto"])
+        wj = body["json"]
+        ok &= check("认不出的 cron：按整轮跑，并把原因写进 warnings + notices",
+                    wj.get("segment") == "all"
+                    and any("不在已知列表" in w for w in wj.get("warnings", []))
+                    and any("不在已知列表" in n for n in wj.get("notices", [])),
+                    json.dumps(wj.get("warnings"), ensure_ascii=False))
+
+        os.environ.pop("TRIGGER_CRON", None)
+        ok &= check("手动指定 --mode cat 生效",
+                    run_cli(["--mode", "cat"])["json"].get("segment") == "cat")
+        ok &= check("旧写法 --cat-only 仍等价于 --mode cat",
+                    run_cli(["--cat-only"])["json"].get("segment") == "cat")
+        body = run_cli([])
+        ok &= check("无 cron、无参数 -> 整轮（默认走安全的一边）",
+                    body["json"].get("segment") == "all", str(body["json"].get("segment")))
+        ok &= check("结果 JSON 里有 cron 段（计划 / 实际 / 延迟）",
+                    isinstance(body["json"].get("cron"), dict)
+                    and "actual_utc" in body["json"]["cron"], "")
+
+        os.environ.pop("WB_ACCOUNTS", None)
+        TRAVEL["state"], TRAVEL["record_id"] = "idle", None
     finally:
         srv.shutdown()
 

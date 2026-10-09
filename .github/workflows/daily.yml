@@ -3,9 +3,14 @@ name: Buddy 加油站每日任务
 # 两类定时，合起来每 6 小时一次（cron 用 UTC：北京时间 = UTC + 8）：
 #   ① 整轮：签到 + 派猫猫                      北京 00:20
 #   ② 只收猫：领已到家的旅行积分 + 该派就派新一趟  北京 06:20 / 12:20 / 18:20
-# 改时间就改 cron。注意 ①②是**同一个文件的两条 cron**，跑哪一段由触发的 cron
-# 自动决定（见下面 run 里的 case），不需要另维护一个模式开关——
-# 改了 cron 忘了改模式，是这类脚本最容易出的事故。
+# 改时间就改 cron。注意 ①②是**同一个文件的两条 cron**：跑哪一段由「触发的 cron」
+# 在 scripts/daily.py 的 SCHEDULE_MODES 里查表决定（脚本里只有这一处映射，
+# 这里不再复制一份 case；两处各写一份、改一处忘一处就是静默事故）。
+# 改了 cron 却没同步那张表：脚本会**大声报警**并按整轮跑（安全的那一边）。
+#
+# 另：GitHub 的 schedule 是「尽力而为」，高峰期会延迟（官方文档明说整点最挤），
+# 实测有晚几分钟到好几小时的。脚本会把「计划 / 实际 / 延迟」打进日志与结果，
+# 晚超过 LATE_MINUTES（30 分钟）还会在通知正文里说明，不用对着凌晨 5 点的通知发懵。
 on:
   schedule:
     - cron: "20 16 * * *"          # ① 整轮
@@ -50,14 +55,17 @@ jobs:
       # 「跑的是旧 commit」已经坑过两次：清单里配了新字段，代码却还是旧的，
       # 新字段被静默忽略，人只能对着「我明明配了怎么没生效」发懵。
       # 把提交号打进日志，一眼就能对照。
-      - name: 记录本次运行的提交
+      - name: 记录本次运行的提交与时间
         run: |
           echo "本次运行提交：${GITHUB_SHA}"
           git log -1 --format='  %h %ad %s' --date=short
+          # 打出真实墙钟时间：cron 是「尽力而为」，日志里有时间才好和计划时间对照
+          date -u '+  实际运行（UTC）：%Y-%m-%d %H:%M:%S'
+          TZ=Asia/Shanghai date '+  实际运行（北京）：%Y-%m-%d %H:%M:%S'
 
       - name: 签到 + 派猫猫，并推送通知
         env:
-          # 触发的 cron（只有 schedule 事件有值）与手动触发时选的模式。
+          # 触发的 cron（只有 schedule 事件有值）与手动触发时选的模式，交给脚本判定档位。
           # 放进 env 再由脚本读，不要在 run 里插 ${{ }}——那等于把外部值拼进 shell。
           TRIGGER_CRON: ${{ github.event.schedule }}
           DISPATCH_MODE: ${{ inputs.mode }}
@@ -124,19 +132,8 @@ jobs:
           PYTHON_BIN="$(command -v python3)"
           echo "python: ${PYTHON_BIN} ($("${PYTHON_BIN}" -V 2>&1))"
 
-          # 跑哪一段：由**触发的 cron** 决定，手动触发则听 mode 输入。
-          # 这样改了 cron 就跑对应的那一段，不会出现「cron 改了、模式忘了改」。
-          MODE="all"
-          case "${TRIGGER_CRON:-}" in
-            "20 22,4,10 * * *") MODE="cat" ;;   # 只收猫那一档
-          esac
-          case "${DISPATCH_MODE:-}" in
-            all|cat) MODE="${DISPATCH_MODE}" ;;  # 手动触发时以选择为准
-          esac
-          echo "本次模式：${MODE}（触发 cron：'${TRIGGER_CRON:-无，手动触发}'）"
-
-          if [ "$MODE" = "cat" ]; then
-            "${PYTHON_BIN}" scripts/daily.py --cat-only
-          else
-            "${PYTHON_BIN}" scripts/daily.py
-          fi
+          # 跑哪一段：交给脚本按「触发的 cron」查表（daily.py 的 SCHEDULE_MODES）决定，
+          # 手动触发时以 mode 输入为准，其余情况传 auto。
+          # 这里刻意不再写一份 cron -> 模式 的 case：两处各写一份，
+          # 改了一处忘了另一处，就是「看起来正常、其实没跑对」的静默错。
+          "${PYTHON_BIN}" scripts/daily.py --mode "${DISPATCH_MODE:-auto}"

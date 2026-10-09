@@ -15,7 +15,7 @@
 2. **猫猫旅行**：
    - ① 先领掉**已经到家**那一趟的旅行积分；
    - ② 再判断今天还能不能派新的一趟——`daily_limit_reached` 为真（今天已经派过）就不派。
-   - > 这两步是同一个闭环。所以**只收猫**的那几轮（`--cat-only`）领完积分会立刻再派一趟，
+   - > 这两步是同一个闭环。所以**只收猫**的那几轮（`--mode cat`）领完积分会立刻再派一趟，
    > 猫不会闲着，积分才转得起来；见「[定时](#定时)」。
 3. **推送通知**：分两层，**可以逐人定制**——
    - **每个人自己的渠道**：账号清单里给他写 `notify`，他那一份就**只发到他自己指定的渠道**（可多个），不进汇总卡片；
@@ -26,7 +26,7 @@
    - **账号内部**，猫猫段被 `try` 兜住——它怎么炸都不改该账号的签到结论。
 
 退出码：所有账号签到成功 → `0`；加 `--allow-partial`（或 `WB_ALLOW_PARTIAL=1`）则「至少一个成功」→ `0`。
-**猫猫段一律不影响退出码**（`--cat-only` 那几轮签到段跳过，此时退出码看猫猫段）。
+**猫猫段一律不影响退出码**（`--mode cat` 那几轮签到段跳过，此时退出码看猫猫段）。
 
 ---
 
@@ -378,19 +378,69 @@ on:
 猫回来后就一直闲着，积分自然攒得慢。每 6 小时收一次，领完立刻又派一趟，一天能转好几轮。
 
 **为什么收猫那几轮不重复签到？** 签到一天一次就够，重复调只是白跑接口。
-所以那几轮用 `--cat-only`，只跑猫猫段（`do_cat()` 本身就是「先领后派」的闭环）。
+所以那几轮用 `--mode cat`，只跑猫猫段（`do_cat()` 本身就是「先领后派」的闭环）。
 
-**跑哪一段不由开关决定，而由「触发的 cron」决定**（workflow 里一个 `case`）。
-这是故意的：如果是手写一个模式开关，改了 cron 忘了改模式就会静默跑错，而且是那种
-「看起来一切正常、就是没积分」的错。
+**跑哪一段由「触发的 cron」决定**，映射表只有一处：`scripts/daily.py` 里的 `SCHEDULE_MODES`。
+workflow 里刻意**不再写一份** `case`——两处各写一份、改了一处忘了另一处，就会静默跑错，
+而且是那种「看起来一切正常、就是没积分」的错。
+改了 cron 却忘了改那张表，脚本会**大声报警**并按整轮跑（安全的那一边），不会悄悄降级。
+`scripts/test_offline.py` 还会直接读 `daily.yml` 逐条核对 cron 与那张表是否一致，对不上就测试失败。
 
 **收猫轮默认只在有变化时推送**，免得「猫还在路上」一天推你四遍。
 真领到积分、派了新的一趟、或者出错，都会照常推。想每轮都推就加 `WB_NOTIFY_MODE: always`。
 
 也可以到 Actions 页面手动触发，并顺手选 `all`（整轮）或 `cat`（只收猫）。
 
-**cron 是 UTC 时间**，换算规则：`北京时间 = UTC + 8`。
-GitHub 的定时任务在高峰时段可能延迟几分钟到几十分钟，属正常现象。
+### cron 是 UTC；而且它是「尽力而为」，不准点是正常的
+
+**换算规则：`北京时间 = UTC + 8`。** 上面两条 cron 对应北京 00:20 与 06/12/18:20。
+
+但更要紧的是另一件事：**GitHub 的 `schedule` 不保证准点。** 官方文档原话：
+
+> The `schedule` event can be delayed during periods of high loads of GitHub Actions workflow runs.
+> High load times include the start of every hour. If the load is sufficiently high enough,
+> some queued jobs may be dropped. To decrease the chance of delay, schedule your workflow to run
+> at a different time of the hour.
+
+也就是：高峰期（整点最挤）会延迟，挤到一定程度**整轮会被丢掉**。这不是个例——社区里
+2026 年 8 月、10 月都有大批人反馈「晚 3~10 小时」，有博主实测 4 个公开仓库的 `*/15`
+工作流，7 天里只有 64% 的时间点到点跑上了，中位延迟 7.4 分钟，最长空档 137 分钟。
+所以**看到通知在凌晨 5 点才来，第一反应不该是怀疑配置**。
+
+本项目为此做了三件事，让它自己说清楚：
+
+1. **日志第一行**就打出计划与实际：
+
+   ```
+   [cron] 触发 cron='20 16 * * *' -> 计划 10-08 16:20Z（北京 10-09 00:20），
+          实际 10-08 21:21Z（北京 10-09 05:21），延迟 301 分钟；本轮模式=整轮
+   ```
+
+2. **结果 JSON 里的 `cron` 段**（机器可读）：`triggered_cron` / `planned_utc` /
+   `planned_local` / `actual_utc` / `actual_local` / `delay_minutes`。
+
+3. **延迟超过 30 分钟**（`LATE_MINUTES`）时，说明会同时写进 `notices`，
+   并**附在推送正文末尾**——收到凌晨 5 点的通知时，正文里就解释了为什么。
+
+**这件事对结果有影响吗？基本没有。** 签到是幂等的、派猫由服务端按天限额把关，
+晚几个小时跑照样达标；真要说影响，只有「整轮被丢掉」这一种——那种情况下的兜底是：
+① 每 6 小时那三档会补派当天的猫；② 签到一天一次，晚点到也比不到好。
+
+> **想再稳一点（可选）：** GitHub 自 2026-03 起支持给 cron 配 IANA 时区，
+> 可以写成下面这样，省掉 UTC 换算：
+>
+> ```yaml
+>     - cron: "20 0 * * *"
+>       timezone: "Asia/Shanghai"
+> ```
+>
+> 本文没默认改成它，是因为**它一旦不被支持，整个 workflow 文件会被判为非法、一条都不跑**
+> ——那正是我们最想避免的「静默失败」。你要改用，请先改完到 Actions 页面手动
+> dispatch 一次确认能跑，再删掉旧的两条 cron。
+>
+> 若要把「定时是否真的发生」也监控起来（`schedule` 被延迟或丢弃时 GitHub **不会**通知你），
+> 可以在最后加一步 ping 一个心跳地址（UptimeRobot / Healthchecks 之类），
+> **没收到心跳就报警**——这是唯一能发现「整轮没跑」的办法。
 
 > ⚠️ 今日派发名额是**按天限额**的（服务端 `daily_limit_reached`），所以收得多勤都不会「刷爆」：
 > 名额用完那几轮会明确回一句「今日派发名额已用完」，不会报错、也不会重复派。
@@ -429,22 +479,21 @@ steps:
 这是一个「只为跑定时任务而生」的仓库最容易踩的坑——某天你会发现它几个月没跑过。
 兜底办法任选一个：每两个月随手 commit 一次；或把 `workflow_dispatch` 当手动补跑。
 
-**② 一天只跑一次，猫猫的礼物会压到第二天才到账。**
-猫猫出去一趟 1~4 小时才回来，而「领礼物」这件事只有下一次运行才做，
-延迟约 20 小时。想更快就把 cron 改成一天多跑几次：
-
-```yaml
-on:
-  schedule:
-    - cron: "20 */4 * * *"   # 每 4 小时一次
-```
+**② 猫猫的礼物会压到下一次运行才到账（现在最多 6 小时）。**
+猫猫出去一趟 1~4 小时才回来，而「领礼物」这件事只有运行到才会做。
+现在 6 小时一档，礼物最坏也就是等 6 小时——**这已经是这套定时能做到的上限**，
+再密不会更快：一天只能派一趟（服务端 `daily_limit_reached`），瓶颈是「当天那趟有没有派成」，
+不是收得多勤。真要多拿分，靠的是 6 小时那三档的**补派**能力：
+整轮那趟若因为延迟、异常或额度问题没派成，中间几轮会把当天名额补上。
 
 **多跑是安全的**：签到幂等（已签只会返回「已签」，不会重复发积分），
 派猫由服务端的 `daily_limit_reached` 把关（今天派过就不再派），
-所以一天跑七次和跑一次的效果一样，只是礼物到账更快、偶发漏跑也能被下一轮补上。
+所以多跑几轮的效果只是礼物到账更快、偶发漏跑能被下一轮补上。
 
 **账号数的两个限制：**时间预算按 `420 + 150 × (账号数 − 1)` 秒自动放大，
-`daily.yml` 里 `timeout-minutes: 20` 要相应调大；账号特别多（十个以上）建议拆成多个 workflow，
+`daily.yml` 里 `timeout-minutes: 30` 必须**明显大于**脚本预算（6 个账号时预算是 1170s），
+否则 GitHub 会先一步强杀进程，脚本那套「超预算就优雅跳过」根本轮不到生效。
+账号特别多（十个以上）相应调大，或拆成多个 workflow，
 否则一个账号卡住会挤掉后面的预算（被挤掉的账号会在卡片上标 `SKIPPED`，下一轮自动补上）。
 
 ---
@@ -488,8 +537,9 @@ python3 scripts/daily.py --only "我,同事A"             # 只跑指定账号�
 python3 scripts/daily.py --local --raw                # 附上脱敏后的原始返回
 python3 scripts/daily.py --local --dry-run            # 只查状态，不做写操作
 python3 scripts/daily.py --local --no-notify          # 不推送，只看结论
-python3 scripts/daily.py --accounts accounts.local.json --cat-only   # 只收猫（跳过签到）
-python3 scripts/daily.py --local --cat-only --no-notify             # 只收猫，看结论不发
+python3 scripts/daily.py --accounts accounts.local.json --mode cat   # 只收猫（跳过签到）
+python3 scripts/daily.py --local --mode cat --no-notify              # 只收猫，看结论不发
+python3 scripts/daily.py --local --mode auto                         # 按 TRIGGER_CRON 自动定档（云端就是这个）
 python3 scripts/test_offline.py                       # 离线全链路自测（假服务端，不开外网）
 python3 scripts/test_notify.py                        # 试通知渠道（真的发一条，失败给原因）
 python3 scripts/test_notify.py --plan --from accounts.local.json  # 只体检路由，不发消息
@@ -556,7 +606,7 @@ workbuddy-daily/
 ├── scripts/
 │   ├── wb_auth.py                # 本机登录态解密（只有刷新脚本用得到）
 │   ├── export_token.py           # 刷新脚本：本机 → 账号清单 → 仓库 secret（含逐人通知配置）
-│   ├── daily.py                  # 云端每天跑这个（多账号 + 逐人/全局两级通知）
+│   ├── daily.py                  # 云端每天跑这个（多账号 + 逐人/全局两级通知 + cron 档位与延迟自证）
 │   ├── test_notify.py            # 通知渠道自检（真的发一条，失败给出原因）+ 路由体检
 │   └── test_offline.py           # 离线全链路自测（假服务端，验证「谁发给谁」）
 ├── accounts.example.json         # 账号清单格式示例（可提交）

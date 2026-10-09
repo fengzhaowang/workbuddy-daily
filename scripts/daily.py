@@ -26,15 +26,21 @@
 
 退出码：所有账号签到成功 => 0；加 --allow-partial 则「至少一个成功」=> 0。
 猫猫段一律不影响退出码（需求：签到成功就算成功）。
-例外：--cat-only 时签到段跳过，此时退出码看猫猫段（否则必然全是失败）。
+例外：--mode cat（旧写法 --cat-only）时签到段跳过，此时退出码看猫猫段。
 
-两类定时（workflow 里用不同 cron 触发）：
+两类定时（workflow 里用不同 cron 触发），跑哪一段由**触发的 cron** 决定：
   * 每天一次「整轮」：签到 + 猫猫；
-  * 其余每 6 小时「只收猫」(--cat-only)：只跑猫猫段。
+  * 其余每 6 小时「只收猫」：只跑猫猫段。
     因为 do_cat() 本身是「先领已到家的积分、再该派就派新的一趟」的闭环，
     收猫轮次领完会立刻再派一趟，积分才转得起来；签到一天一次就够，不必重复。
+  cron -> 档位 的映射表只有一处（下面 SCHEDULE_MODES），workflow 里不再复制一份，
+  test_offline.py 会读 workflow 文件逐条核对，改了 cron 忘了改档位会当场失败。
   收猫轮次默认只在**有变化时**推送（内置 _has_news 判断），
   免得「猫还在路上」一天推四遍。要每轮都推就加 --notify-mode always。
+
+关于「几点触发的」：GitHub 的 schedule 是**尽力而为**——官方文档写明高峰期会延迟
+（整点最挤），实测有晚几分钟到好几小时的。所以脚本会把「计划 / 实际 / 延迟」算出来
+写进 stderr、body.cron 与 notices；晚超过 LATE_MINUTES 还会在推送正文末尾附一句说明。
 
 凭证来源（优先级从高到低）：
   1. --local                  本机登录态（调试用，单账号）
@@ -47,9 +53,10 @@
 所以它跟 token 一样不能进仓库、不进日志；报错信息里只报「缺哪个字段」。
 
 用法：
-  python3 scripts/daily.py                          # 云端：整轮（签到 + 猫猫）
-  python3 scripts/daily.py --cat-only               # 只收猫（领积分 + 该派就派）
-  python3 scripts/daily.py --cat-only --notify-mode always   # 收猫也每轮都推
+  python3 scripts/daily.py                          # 云端：按触发的 cron 自动定档位
+  python3 scripts/daily.py --mode cat               # 只收猫（领积分 + 该派就派）
+  python3 scripts/daily.py --cat-only               # 同上，旧写法
+  python3 scripts/daily.py --mode cat --notify-mode always    # 收猫也每轮都推
   python3 scripts/daily.py --local                  # 本机单账号
   python3 scripts/daily.py --accounts accounts.local.json   # 本机多账号
   python3 scripts/daily.py --list-accounts          # 只列出识别到的账号（脱敏 + 渠道）
@@ -57,6 +64,10 @@
   python3 scripts/daily.py --local --raw            # 附上脱敏后的原始返回
   python3 scripts/daily.py --dry-run                # 只查状态，不做写操作
   python3 scripts/daily.py --no-notify              # 不推送，只看结论
+
+自检脚本：
+  python3 scripts/test_offline.py    # 本机假服务端跑通全链路（含 cron 档位与延迟算例）
+  python3 scripts/test_notify.py     # 真发一条通知，验证渠道配置
 """
 
 from __future__ import annotations
@@ -73,6 +84,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from typing import Any, Optional
 
@@ -95,6 +107,128 @@ BUDGET_BASE_SECONDS = 420.0
 BUDGET_PER_EXTRA_ACCOUNT = 150.0
 _started_at = time.monotonic()
 _BUDGET: float = float(os.environ.get("WB_BUDGET_SECONDS") or BUDGET_BASE_SECONDS)
+
+# ================= 定时档位（唯一真相）=================
+# 「触发的 cron」-> 本轮跑哪一段。**必须与 .github/workflows/daily.yml 里的 cron
+# 逐字一致**，scripts/test_offline.py 会直接读那个文件逐条核对：
+# 改了一处忘了另一处，以前是「看起来正常、就是没积分」的静默错，现在当场失败。
+SCHEDULE_MODES = {
+    "20 16 * * *": "all",            # 北京 00:20        整轮：签到 + 派猫猫
+    "20 22,4,10 * * *": "cat",       # 北京 06/12/18:20  只收猫：领已到家的积分 + 该派就派
+}
+CRON_TZ_OFFSET_HOURS = 8             # cron 走 UTC；只用于日志里换算成北京时间给人看
+LATE_MINUTES = 30                    # 比计划晚这么多分钟，就在结果与推送里说明原因
+
+UNKNOWN_CRON_WARNING = (
+    "触发的 cron「%s」不在已知列表里：本轮按整轮（签到+猫猫）跑——安全的那一边。"
+    "若你刚在 workflow 里改过 cron，请同步 daily.py 的 SCHEDULE_MODES，"
+    "否则收猫那一档会悄悄变成整轮（不会少领积分，但会多跑一段签到、推送也更吵）。")
+
+# GitHub 的 schedule 是**尽力而为**：官方文档写明高峰期会延迟（整点最挤），
+# 实测有晚几分钟到好几小时的，甚至整轮被丢弃。所以「几点触发的」不该靠猜，
+# 下面几个函数把它算清楚写进日志、notices 与结果 JSON。
+
+
+def _cron_hm(cron: str) -> Optional[tuple[list[int], list[int]]]:
+    """极简 cron 解析：只认我们在用的 "M H[,H…] * * *" 形态，其余一律返回 None。
+
+    刻意不引 cron 库：这里只需要「最近一次计划时间」，而
+    「认不出来就明说认不出来」比「假装支持全套语法」安全得多。
+    """
+    parts = (cron or "").split()
+    if len(parts) != 5 or parts[2:] != ["*", "*", "*"]:
+        return None
+    try:
+        mins = sorted({int(x) for x in parts[0].split(",")})
+        hrs = sorted({int(x) for x in parts[1].split(",")})
+    except ValueError:
+        return None
+    if not mins or not hrs:
+        return None
+    if any(not 0 <= m <= 59 for m in mins) or any(not 0 <= h <= 23 for h in hrs):
+        return None
+    return mins, hrs
+
+
+def cron_slot(cron: str, now: Optional[datetime] = None) -> Optional[datetime]:
+    """这条 cron 最近一次「本该触发」的时刻（UTC）；认不出来返回 None。"""
+    hm = _cron_hm(cron)
+    if hm is None:
+        return None
+    mins, hrs = hm
+    now = now or datetime.now(timezone.utc)
+    for back in (0, 1):                       # 今天找不到就看昨天（跨零点的档）
+        day = (now - timedelta(days=back)).date()
+        due = [datetime(day.year, day.month, day.day, h, m, tzinfo=timezone.utc)
+               for h in hrs for m in mins
+               if datetime(day.year, day.month, day.day, h, m, tzinfo=timezone.utc) <= now]
+        if due:
+            return max(due)
+    return None
+
+
+def _beijing_hhmm(dt: datetime) -> str:
+    return (dt + timedelta(hours=CRON_TZ_OFFSET_HOURS)).strftime("%m-%d %H:%M")
+
+
+def cron_report(trigger: str, now: Optional[datetime] = None) -> dict:
+    """算清「计划几点 vs 实际几点、晚了多久」，供日志 / notices / 结果 JSON 用。
+
+    为什么要写成一件正经事：不把这件事写进结果，人只会看到
+    「我明明设的 00:20，怎么凌晨 5 点才发通知」，然后去怀疑自己的配置
+    —— 而根因其实在 GitHub 的定时器。
+    """
+    now = now or datetime.now(timezone.utc)
+    rep: dict = {
+        "timezone": "UTC",
+        "triggered_cron": trigger or "",
+        "plan": SCHEDULE_MODES.get(trigger or ""),
+        "actual_utc": now.strftime("%m-%d %H:%M"),
+        "actual_local": _beijing_hhmm(now),
+        "delay_minutes": None,
+    }
+    if not trigger:
+        rep["reason"] = "手动触发（workflow_dispatch）：没有计划时间，不存在延迟"
+        return rep
+
+    slot = cron_slot(trigger, now)
+    if slot is None:
+        rep["reason"] = "这条 cron 认不出来，算不出计划时间"
+        rep["warning"] = UNKNOWN_CRON_WARNING % trigger
+        return rep
+
+    delay = int((now - slot).total_seconds() // 60)
+    rep.update({"planned_utc": slot.strftime("%m-%d %H:%M"),
+                "planned_local": _beijing_hhmm(slot),
+                "delay_minutes": delay})
+    if rep["plan"] is None:
+        rep["warning"] = UNKNOWN_CRON_WARNING % trigger
+    return rep
+
+
+def cron_line(rep: dict) -> str:
+    """给 stderr 一行话。Actions 日志里应当一眼看到「计划 -> 实际，晚了多少」。"""
+    if not rep.get("triggered_cron"):
+        return "本轮为手动触发，无计划时间"
+    if rep.get("planned_utc") is None:
+        return "触发 cron='%s'，认不出它的计划时间（详见 notices）" % rep["triggered_cron"]
+    return ("触发 cron='%s' -> 计划 %sZ（北京 %s），实际 %sZ（北京 %s），延迟 %s 分钟"
+            % (rep["triggered_cron"], rep["planned_utc"], rep["planned_local"],
+               rep["actual_utc"], rep["actual_local"], rep["delay_minutes"]))
+
+
+def late_note(rep: dict) -> str:
+    """晚得太久时给人一句能看懂的话（进 notices，也附在推送正文末尾）。"""
+    d = rep.get("delay_minutes")
+    if d is None or d < LATE_MINUTES:
+        return ""
+    took = ("%d 小时 %d 分" % (d // 60, d % 60)) if d >= 60 else ("%d 分钟" % d)
+    return ("⏱ 本轮是 GitHub 定时器延迟触发的：计划 UTC %s（北京 %s），"
+            "实际 UTC %s（北京 %s），晚了 %s。"
+            "GitHub 的 cron 只是「尽力而为」（官方文档：高峰期会延迟，整点最挤），"
+            "晚几分钟到几小时都属正常，不是配置写错了。"
+            % (rep.get("planned_utc"), rep.get("planned_local"),
+               rep.get("actual_utc"), rep.get("actual_local"), took))
 
 # ---------- 接口路径：全部与客户端实际请求核对通过 ----------
 # 每个路径都用真实请求验证过「存在且语义正确」，不是网上抄的旧名字。
@@ -905,12 +1039,22 @@ def _lines_to_plain(lines: list[str]) -> str:
 
 
 def _fmt_sections(sections: list[dict], md: bool = True) -> str:
-    """把各账号拼成一段文本：每个账号一块，块内「签到」「猫猫」分行。"""
-    multi = len(sections) > 1
+    """把各账号拼成一段文本：每个账号一块，块内「签到」「猫猫」分行。
+
+    `{"note": "…"}` 这种条目不占账号编号，渲染成末尾一行说明。
+    编号只看账号条目——否则「只有 1 个账号 + 1 行说明」会被编成「1. 张三」，
+    看着像多账号。
+    """
+    multi = len([s for s in sections if not s.get("note")]) > 1
     blocks = []
-    for i, s in enumerate(sections):
+    idx = 0
+    for s in sections:
+        if s.get("note"):
+            blocks.append(s["note"])
+            continue
+        idx += 1
         if multi:
-            head = "**%d. %s**" % (i + 1, s["name"]) if md else "%d. %s" % (i + 1, s["name"])
+            head = "**%d. %s**" % (idx, s["name"]) if md else "%d. %s" % (idx, s["name"])
         else:
             head = "**%s**" % s["name"] if md else s["name"]
         ck = _lines_to_md(s.get("checkin") or []) if md else _lines_to_plain(s.get("checkin") or [])
@@ -933,13 +1077,21 @@ def build_feishu_card(stamp: str, env: str, sections: list[dict],
     避免「自检能通、线上不通」这种最难查的偏差。
 
     sections: [{"name": str, "checkin": [lines], "cat": [lines]}, ...]
+             末尾可附 {"note": str}：不占编号，单独一行说明（与 _fmt_sections 一致）
     """
     elements: list[dict] = []
-    multi = len(sections) > 1
-    for i, s in enumerate(sections):
-        if i:
+    multi = len([s for s in sections if not s.get("note")]) > 1
+    idx = 0
+    for s in sections:
+        if s.get("note"):
+            elements.append({"tag": "div", "fields": [
+                {"is_short": False,
+                 "text": {"tag": "lark_md", "content": s["note"]}}]})
+            continue
+        idx += 1
+        if elements:
             elements.append({"tag": "hr"})
-        head = "**%d. %s**" % (i + 1, s["name"]) if multi else "**%s**" % s["name"]
+        head = "**%d. %s**" % (idx, s["name"]) if multi else "**%s**" % s["name"]
         content = "%s\n🏠 **签到**\n%s\n🐾 **猫猫**\n%s" % (
             head, _lines_to_md(s.get("checkin") or []), _lines_to_md(s.get("cat") or []))
         elements.append({"tag": "div", "fields": [
@@ -1236,9 +1388,17 @@ def _public(obj: Any) -> Any:
     return obj
 
 
-def _sections_of(results: list[dict]) -> list[dict]:
-    return [{"name": r["name"], "checkin": r["checkin"]["lines"],
+def _sections_of(results: list[dict], note: str = "") -> list[dict]:
+    """账号分区列表；note 非空时在末尾附加一行说明（不占账号编号）。
+
+    说明行用来放「本轮因为 GitHub 定时器延迟才 5 点发出来」这类话——
+    收到通知的人第一反应就是「怎么这个点发」，正文里答掉它，省一次困惑。
+    """
+    secs = [{"name": r["name"], "checkin": r["checkin"]["lines"],
              "cat": r["cat"]["lines"]} for r in results]
+    if note:
+        secs.append({"note": note})
+    return secs
 
 
 # 猫猫段的这些结论属于「一切照旧」，没有必须告诉人的信息
@@ -1259,13 +1419,14 @@ def _has_news(results: list[dict]) -> bool:
     return False
 
 
-def notify(results: list[dict], stamp: str, env: str) -> list[str]:
+def notify(results: list[dict], stamp: str, env: str, note: str = "") -> list[str]:
     """推送。逐人分层，互不牵连：
 
     * 声明了自己的渠道（`notify`）的账号：**只**发给他自己那几个渠道，
       不混进汇总卡片，也不受全局 NOTIFY_CHANNELS 影响；
     * 其余账号：汇总成一份，发到全局渠道（detect_channels）。
 
+    note 非空时附在正文末尾（例如「本轮是 GitHub 定时器延迟触发的」）。
     单个渠道失败只写进 notices，不影响退出码，也不影响别的渠道。
     """
     notices: list[str] = []
@@ -1283,7 +1444,7 @@ def notify(results: list[dict], stamp: str, env: str) -> list[str]:
             if not r.get("_declared_notify"):
                 shared.append(r)
             continue
-        secs = _sections_of([r])
+        secs = _sections_of([r], note)
         for ch, cfg in resolved.items():
             notices.append("%s → %s" % (r["name"], _dispatch(
                 ch, cfg, stamp, env, title, secs, r["checkin_ok"])))
@@ -1300,7 +1461,7 @@ def notify(results: list[dict], stamp: str, env: str) -> list[str]:
                 "重新 export_token.py --push，并确认 Actions 跑的是最新提交。"
                 "详见 README「通知渠道」一节）" % (who, len(shared)))
         else:
-            secs = _sections_of(shared)
+            secs = _sections_of(shared, note)
             ok = all(r["checkin_ok"] for r in shared)
             for ch in channels:
                 notices.append(_dispatch(ch, _env_cfg(ch), stamp, env, title, secs, ok))
@@ -1319,9 +1480,12 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="只查状态，不做写操作")
     ap.add_argument("--raw", action="store_true", help="附上脱敏后的原始返回")
     ap.add_argument("--no-notify", action="store_true", help="不推送，只看结论")
+    ap.add_argument("--mode", choices=("auto", "all", "cat"), default="auto",
+                    help="跑哪一段。auto（默认）：按「触发的 cron」自动判定"
+                         "（workflow 注入 TRIGGER_CRON；认不出来按整轮跑并报警）；"
+                         "all 签到 + 猫猫；cat 只收猫")
     ap.add_argument("--cat-only", action="store_true",
-                    help="只跑猫猫段（领已到家的旅行积分 + 该派就派新的一趟），跳过签到。"
-                         "给「每隔几小时收一次猫」的定时用")
+                    help="等价于 --mode cat：只收猫（领已到家的积分 + 该派就派新的一趟），跳过签到")
     ap.add_argument("--notify-mode", choices=("auto", "always", "onchange"), default="auto",
                     help="auto（默认）：整轮跑总是推送，--cat-only 时只在有变化时推送；"
                          "always 每轮都推；onchange 只在有变化时推")
@@ -1333,12 +1497,24 @@ def main() -> int:
     allow_partial = args.allow_partial or (
         (os.environ.get("WB_ALLOW_PARTIAL") or "").strip().lower() in ("1", "true", "yes", "on"))
 
+    # 跑哪一段：手动指定优先；auto 则由「触发的 cron」决定。
+    # 映射表 SCHEDULE_MODES 只有这一处，workflow 里不再复制一份 case——
+    # 两处各写一份、改了一处忘了另一处，就是这类脚本最容易出的静默事故。
+    trigger = (os.environ.get("TRIGGER_CRON") or "").strip()
+    cron_rep = cron_report(trigger)
+    if args.mode == "auto":
+        cat_only = args.cat_only or (cron_rep.get("plan") == "cat")
+    else:
+        cat_only = args.cat_only or args.mode == "cat"
+    print("[cron] %s；本轮模式=%s" % (cron_line(cron_rep), "只收猫" if cat_only else "整轮"),
+          file=sys.stderr)
+
     # 推送频率：默认「整轮跑每轮都推，只收猫的轮次只在有变化时推」。
     # 收猫轮一天跑好几次，把「猫还在路上」也推一遍就是纯噪音。
     notify_mode = (args.notify_mode if args.notify_mode != "auto"
                    else (os.environ.get("WB_NOTIFY_MODE") or "").strip().lower())
     if notify_mode not in ("always", "onchange"):
-        notify_mode = "onchange" if args.cat_only else "always"
+        notify_mode = "onchange" if cat_only else "always"
 
     try:
         accounts = _load_accounts(args)
@@ -1366,7 +1542,7 @@ def main() -> int:
 
     print("[cred] 共 %d 个账号，预算 %.0fs，本轮=%s，推送=%s"
           % (len(accounts), _BUDGET,
-             "只收猫（跳过签到）" if args.cat_only else "签到 + 猫猫", notify_mode),
+             "只收猫（跳过签到）" if cat_only else "签到 + 猫猫", notify_mode),
           file=sys.stderr)
     for a in accounts:
         chans, problems = account_channels(a)
@@ -1401,7 +1577,7 @@ def main() -> int:
                 "_trace": [], "_notify": resolved, "_notify_problems": problems,
                 "_declared_notify": bool(a.notify)})
             continue
-        results.append(run_one(a, args.dry_run, cat_only=args.cat_only))
+        results.append(run_one(a, args.dry_run, cat_only=cat_only))
 
     stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime())
     env_name = os.environ.get("WB_ENV", "prod")
@@ -1409,7 +1585,7 @@ def main() -> int:
     checkin_oks = [r["checkin_ok"] for r in results]
     cat_oks = [r["cat_ok"] for r in results]
     # 判定用哪一段：只收猫的轮次里签到段恒为 SKIPPED，拿它当门槛等于必失败
-    gates = cat_oks if args.cat_only else checkin_oks
+    gates = cat_oks if cat_only else checkin_oks
     ok = any(gates) if allow_partial else all(gates)
     n_ok = sum(1 for x in checkin_oks if x)
 
@@ -1418,8 +1594,11 @@ def main() -> int:
         "timestamp": stamp,
         "env": env_name,
         # 本轮实际跑了哪几段，方便在 Actions 日志里一眼区分两类定时
-        "segment": "cat" if args.cat_only else "all",
+        "segment": "cat" if cat_only else "all",
         "mode": "partial" if allow_partial else "all",
+        # 「计划几点、实际几点、晚了多久」：GitHub 的 cron 是尽力而为，
+        # 不写进结果就只能靠猜，人只会怀疑自己的配置。
+        "cron": cron_rep,
         "summary": {
             "total": len(results),
             "checkin_ok": n_ok,
@@ -1428,12 +1607,18 @@ def main() -> int:
         },
         "accounts": _public(results),
     }
-    if args.cat_only:
+    if cat_only:
         body["summary"]["note"] = (
             "本轮只收猫：签到段跳过，checkin_ok 恒为 0 属正常，成败看 cat_ok")
     if args.raw:
         for pub, raw in zip(body["accounts"], results):
             pub["raw"] = raw["_trace"]
+
+    # 延迟太久 / cron 认不出来：给人一句能看懂的话，别让人对着「我明明设的 00:20」发懵
+    late = late_note(cron_rep)
+    cron_warnings = [w for w in (cron_rep.get("warning"), late) if w]
+    for w in cron_warnings:
+        print("  ⚠️ %s" % w, file=sys.stderr)
 
     if args.no_notify:
         body["notices"] = ["(--no-notify：已跳过推送)"]
@@ -1441,12 +1626,16 @@ def main() -> int:
         # 一天要跑好几轮，没变化就不打扰；真出错 / 领到积分 / 派了新一趟都会走下面
         body["notices"] = ["（本轮无变化：猫猫还在路上或今日名额已用完，未推送以免打扰）"]
     else:
-        body["notices"] = notify(results, stamp, env_name)
+        # 延迟说明附进推送正文：收到 5 点的通知时，正文里就能看到为什么
+        body["notices"] = notify(results, stamp, env_name, note=late)
 
     # 「配置被静默忽略」是最难自查的一类问题：放到最显眼的两处，别让人去翻日志
     if unknown_warnings:
         body["warnings"] = unknown_warnings
         body["notices"] = unknown_warnings + body["notices"]
+    if cron_warnings:
+        body["warnings"] = cron_warnings + body.get("warnings", [])
+        body["notices"] = cron_warnings + body["notices"]
 
     print(json.dumps(body, ensure_ascii=False, indent=2))
 
