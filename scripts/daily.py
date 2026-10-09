@@ -26,6 +26,15 @@
 
 退出码：所有账号签到成功 => 0；加 --allow-partial 则「至少一个成功」=> 0。
 猫猫段一律不影响退出码（需求：签到成功就算成功）。
+例外：--cat-only 时签到段跳过，此时退出码看猫猫段（否则必然全是失败）。
+
+两类定时（workflow 里用不同 cron 触发）：
+  * 每天一次「整轮」：签到 + 猫猫；
+  * 其余每 6 小时「只收猫」(--cat-only)：只跑猫猫段。
+    因为 do_cat() 本身是「先领已到家的积分、再该派就派新的一趟」的闭环，
+    收猫轮次领完会立刻再派一趟，积分才转得起来；签到一天一次就够，不必重复。
+  收猫轮次默认只在**有变化时**推送（内置 _has_news 判断），
+  免得「猫还在路上」一天推四遍。要每轮都推就加 --notify-mode always。
 
 凭证来源（优先级从高到低）：
   1. --local                  本机登录态（调试用，单账号）
@@ -38,7 +47,9 @@
 所以它跟 token 一样不能进仓库、不进日志；报错信息里只报「缺哪个字段」。
 
 用法：
-  python3 scripts/daily.py                          # 云端：读 WB_ACCOUNTS
+  python3 scripts/daily.py                          # 云端：整轮（签到 + 猫猫）
+  python3 scripts/daily.py --cat-only               # 只收猫（领积分 + 该派就派）
+  python3 scripts/daily.py --cat-only --notify-mode always   # 收猫也每轮都推
   python3 scripts/daily.py --local                  # 本机单账号
   python3 scripts/daily.py --accounts accounts.local.json   # 本机多账号
   python3 scripts/daily.py --list-accounts          # 只列出识别到的账号（脱敏 + 渠道）
@@ -1186,10 +1197,20 @@ def _dispatch(ch: str, cfg: dict, stamp: str, env: str, title: str,
 
 
 # ================= 单账号执行 =================
-def run_one(acc: Account, dry_run: bool = False) -> dict:
-    """跑一个账号。返回的 dict 里下划线开头的键是内部字段，不对外输出。"""
+def run_one(acc: Account, dry_run: bool = False, cat_only: bool = False) -> dict:
+    """跑一个账号。返回的 dict 里下划线开头的键是内部字段，不对外输出。
+
+    cat_only=True：只跑猫猫段（领已到家的积分 + 该派就派新的一趟），跳过签到段。
+    用于「六小时收一次猫」那几轮——签到一天一次就够，重复调只是白跑接口。
+    do_cat() 本身自带「先领后派」的闭环，所以收猫轮次不会让猫闲着，
+    领完积分会立刻再派一趟，积分才转得起来。
+    """
     api = Api(acc.endpoint, acc.token, acc.uid, acc.domain)
-    checkin = do_checkin(api, dry_run)
+    if cat_only:
+        checkin = {"ok": False, "segment": "签到", "result": "SKIPPED",
+                   "lines": ["（本轮只收猫，签到段跳过——签到每天一次即可）"]}
+    else:
+        checkin = do_checkin(api, dry_run)
     cat = do_cat(api, dry_run)          # 独立 try，炸了也只影响本段
     resolved, problems = account_channels(acc)
     return {
@@ -1218,6 +1239,24 @@ def _public(obj: Any) -> Any:
 def _sections_of(results: list[dict]) -> list[dict]:
     return [{"name": r["name"], "checkin": r["checkin"]["lines"],
              "cat": r["cat"]["lines"]} for r in results]
+
+
+# 猫猫段的这些结论属于「一切照旧」，没有必须告诉人的信息
+_QUIET_CAT_RESULTS = frozenset({"TRAVELING", "LIMIT", "IDLE", "DRY_RUN", "SKIPPED"})
+
+
+def _has_news(results: list[dict]) -> bool:
+    """这轮有没有值得打扰人的变化（领到积分 / 派了新的一趟 / 出错）。
+
+    只收猫的轮次一天要跑好几次，「猫还在路上」每次推一遍就是纯噪音，
+    所以那几轮默认只在有变化时才推送（--notify-mode always 可改回每次都推）。
+    """
+    for r in results:
+        if r["cat"]["result"] not in _QUIET_CAT_RESULTS:
+            return True
+        if r["checkin"]["result"] != "SKIPPED" and not r["checkin_ok"]:
+            return True
+    return False
 
 
 def notify(results: list[dict], stamp: str, env: str) -> list[str]:
@@ -1280,6 +1319,12 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="只查状态，不做写操作")
     ap.add_argument("--raw", action="store_true", help="附上脱敏后的原始返回")
     ap.add_argument("--no-notify", action="store_true", help="不推送，只看结论")
+    ap.add_argument("--cat-only", action="store_true",
+                    help="只跑猫猫段（领已到家的旅行积分 + 该派就派新的一趟），跳过签到。"
+                         "给「每隔几小时收一次猫」的定时用")
+    ap.add_argument("--notify-mode", choices=("auto", "always", "onchange"), default="auto",
+                    help="auto（默认）：整轮跑总是推送，--cat-only 时只在有变化时推送；"
+                         "always 每轮都推；onchange 只在有变化时推")
     ap.add_argument("--allow-partial", action="store_true",
                     help="只要有任意一个账号签到成功就返回 0（默认要求全部成功）")
     args = ap.parse_args()
@@ -1287,6 +1332,13 @@ def main() -> int:
     # 也认环境变量，方便在 workflow 里开关，不用改命令行
     allow_partial = args.allow_partial or (
         (os.environ.get("WB_ALLOW_PARTIAL") or "").strip().lower() in ("1", "true", "yes", "on"))
+
+    # 推送频率：默认「整轮跑每轮都推，只收猫的轮次只在有变化时推」。
+    # 收猫轮一天跑好几次，把「猫还在路上」也推一遍就是纯噪音。
+    notify_mode = (args.notify_mode if args.notify_mode != "auto"
+                   else (os.environ.get("WB_NOTIFY_MODE") or "").strip().lower())
+    if notify_mode not in ("always", "onchange"):
+        notify_mode = "onchange" if args.cat_only else "always"
 
     try:
         accounts = _load_accounts(args)
@@ -1312,7 +1364,10 @@ def main() -> int:
                          ensure_ascii=False, indent=2))
         return 0
 
-    print("[cred] 共 %d 个账号，预算 %.0fs" % (len(accounts), _BUDGET), file=sys.stderr)
+    print("[cred] 共 %d 个账号，预算 %.0fs，本轮=%s，推送=%s"
+          % (len(accounts), _BUDGET,
+             "只收猫（跳过签到）" if args.cat_only else "签到 + 猫猫", notify_mode),
+          file=sys.stderr)
     for a in accounts:
         chans, problems = account_channels(a)
         where = "、".join(CHANNEL_LABEL.get(c, c) for c in chans) or (
@@ -1346,34 +1401,45 @@ def main() -> int:
                 "_trace": [], "_notify": resolved, "_notify_problems": problems,
                 "_declared_notify": bool(a.notify)})
             continue
-        results.append(run_one(a, args.dry_run))
+        results.append(run_one(a, args.dry_run, cat_only=args.cat_only))
 
     stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime())
     env_name = os.environ.get("WB_ENV", "prod")
 
     checkin_oks = [r["checkin_ok"] for r in results]
-    ok = any(checkin_oks) if allow_partial else all(checkin_oks)
+    cat_oks = [r["cat_ok"] for r in results]
+    # 判定用哪一段：只收猫的轮次里签到段恒为 SKIPPED，拿它当门槛等于必失败
+    gates = cat_oks if args.cat_only else checkin_oks
+    ok = any(gates) if allow_partial else all(gates)
     n_ok = sum(1 for x in checkin_oks if x)
 
     body = {
         "ok": ok,
         "timestamp": stamp,
         "env": env_name,
+        # 本轮实际跑了哪几段，方便在 Actions 日志里一眼区分两类定时
+        "segment": "cat" if args.cat_only else "all",
         "mode": "partial" if allow_partial else "all",
         "summary": {
             "total": len(results),
             "checkin_ok": n_ok,
             "cat_ok": sum(1 for r in results if r["cat_ok"]),
-            "failed": [r["name"] for r in results if not r["checkin_ok"]],
+            "failed": [r["name"] for r, g in zip(results, gates) if not g],
         },
         "accounts": _public(results),
     }
+    if args.cat_only:
+        body["summary"]["note"] = (
+            "本轮只收猫：签到段跳过，checkin_ok 恒为 0 属正常，成败看 cat_ok")
     if args.raw:
         for pub, raw in zip(body["accounts"], results):
             pub["raw"] = raw["_trace"]
 
     if args.no_notify:
         body["notices"] = ["(--no-notify：已跳过推送)"]
+    elif notify_mode == "onchange" and not _has_news(results):
+        # 一天要跑好几轮，没变化就不打扰；真出错 / 领到积分 / 派了新一趟都会走下面
+        body["notices"] = ["（本轮无变化：猫猫还在路上或今日名额已用完，未推送以免打扰）"]
     else:
         body["notices"] = notify(results, stamp, env_name)
 

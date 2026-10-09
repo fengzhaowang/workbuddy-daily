@@ -29,6 +29,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import daily  # noqa: E402
 
 SEEN: list[dict] = []          # 假服务端收到的每一次请求
+# 猫猫旅行状态可切换，用来演「还在路上」和「已到家」两种情形
+TRAVEL: dict = {"state": "idle", "record_id": None}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -65,7 +67,7 @@ class Handler(BaseHTTPRequestHandler):
         if p == daily.P_BUDDY_INFO:
             return self._reply({"code": 0, "data": {"buddy": {"name": "龙焰喵", "rarity": "SSR"}}})
         if p == daily.P_TRAVEL_STATUS:
-            return self._reply({"code": 0, "data": {"state": "idle", "record_id": None}})
+            return self._reply({"code": 0, "data": dict(TRAVEL)})
         if p == daily.P_TRAVEL_CONFIG:
             return self._reply({"code": 0, "data": {"locations": [
                 {"id": 7, "name": "咖啡馆", "duration_hours_min": 1}]}})
@@ -95,6 +97,27 @@ def bodies(path: str) -> list[str]:
 def check(label: str, cond: bool, detail: str = "") -> bool:
     print("  %s %s%s" % ("✅" if cond else "❌", label, "" if cond else "  <- %s" % detail))
     return cond
+
+
+def run_cli(argv: list) -> dict:
+    """按命令行方式真跑一次 daily.main()，把 stdout 里的 JSON 收回来。
+
+    走命令行而不是直接调函数，是为了连「参数有没有真的接上」一起验——
+    「写了函数」≠「接上了」是这个地方最容易犯的错。
+    """
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    saved = sys.argv
+    sys.argv = ["daily.py"] + list(argv)
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = daily.main()
+    finally:
+        sys.argv = saved
+    out = buf.getvalue().strip()
+    return {"rc": rc, "json": json.loads(out) if out.startswith("{") else {}, "stdout": out}
 
 
 def main() -> int:
@@ -202,6 +225,51 @@ def main() -> int:
         msg = next((n for n in n2 if "未配置任何推送渠道" in n), "")
         ok &= check("提示点名了受影响的账号（庚、辛）且给了下一步",
                     "庚" in msg and "辛" in msg and "--push" in msg and "提交" in msg, msg)
+
+        print("⑦ --cat-only：只收猫（六小时一档），不碰签到接口")
+        os.environ.pop("DINGTALK_WEBHOOK", None)
+        os.environ.pop("SERVERCHAN_KEY", None)
+        os.environ["WB_ACCOUNTS"] = json.dumps({"accounts": [
+            {"name": "壬", "token": "t9", "uid": "u9", "endpoint": base,
+             "notify": {"wecom": base + "/push/ren"}}]}, ensure_ascii=False)
+
+        # ① 猫还在路上：没东西可领，不该推送（一天四遍「猫还在路上」是噪音）
+        SEEN.clear()
+        TRAVEL["state"], TRAVEL["record_id"] = "traveling", None
+        body = run_cli(["--cat-only"])
+        touched = {s["path"].split("?")[0] for s in SEEN}
+        ok &= check("没调用签到接口（--cat-only 真的跳过了签到段）",
+                    daily.P_CHECKIN_STATUS not in touched
+                    and daily.P_CHECKIN_CLAIM not in touched, str(sorted(touched)))
+        ok &= check("猫还在路上 -> 0 个推送请求", bodies("/push/ren") == [],
+                    str(bodies("/push/ren")))
+        ok &= check("无变化时把原因写进 notices",
+                    any("无变化" in n for n in body["json"].get("notices", [])),
+                    str(body["json"].get("notices")))
+        ok &= check("退出码看猫猫段（路上 = 成功 = 0）",
+                    body["rc"] == 0 and body["json"].get("ok") is True,
+                    "rc=%s ok=%s" % (body["rc"], body["json"].get("ok")))
+        ok &= check('结果里标明 segment="cat"',
+                    body["json"].get("segment") == "cat", str(body["json"].get("segment")))
+
+        # ② 猫已到家：领积分，并且因为 do_cat 是「先领后派」的闭环，
+        #    领完会立刻再派一趟 —— 不然猫就闲着，积分转不起来
+        SEEN.clear()
+        TRAVEL["state"], TRAVEL["record_id"] = "arrived", "r1"
+        body = run_cli(["--cat-only"])
+        ok &= check("已到家 -> 调了领取接口", len(bodies(daily.P_TRAVEL_CLAIM)) == 1,
+                    str(bodies(daily.P_TRAVEL_CLAIM)))
+        ok &= check("领完立刻又派了一趟（猫不会闲着）",
+                    len(bodies(daily.P_TRAVEL_DEPART)) == 1,
+                    str(bodies(daily.P_TRAVEL_DEPART)))
+        ok &= check("有收获 -> 推送 1 条", len(bodies("/push/ren")) == 1,
+                    str(len(bodies("/push/ren"))))
+        ok &= check("推送里写明领到多少积分",
+                    "领到已到家的旅行积分" in (bodies("/push/ren") or [""])[0],
+                    (bodies("/push/ren") or [""])[0][:120])
+
+        TRAVEL["state"], TRAVEL["record_id"] = "idle", None
+        os.environ.pop("WB_ACCOUNTS", None)
     finally:
         srv.shutdown()
 

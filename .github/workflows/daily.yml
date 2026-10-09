@@ -1,12 +1,25 @@
 name: Buddy 加油站每日任务
 
-# 每天定时跑一次，一次把「签到」和「派猫猫旅行」都做掉（多账号）。
-# cron 用 UTC：下面这行 = 北京时间每天 00:20 执行。
-# 想改时间就改 cron，注意换算：北京时间 = UTC + 8。
+# 两类定时，合起来每 6 小时一次（cron 用 UTC：北京时间 = UTC + 8）：
+#   ① 整轮：签到 + 派猫猫                      北京 00:20
+#   ② 只收猫：领已到家的旅行积分 + 该派就派新一趟  北京 06:20 / 12:20 / 18:20
+# 改时间就改 cron。注意 ①②是**同一个文件的两条 cron**，跑哪一段由触发的 cron
+# 自动决定（见下面 run 里的 case），不需要另维护一个模式开关——
+# 改了 cron 忘了改模式，是这类脚本最容易出的事故。
 on:
   schedule:
-    - cron: "20 16 * * *"
-  workflow_dispatch: {}      # 也可以到 Actions 页面手动点一次
+    - cron: "20 16 * * *"          # ① 整轮
+    - cron: "20 22,4,10 * * *"     # ② 只收猫（UTC 22/04/10 点，即北京 6/12/18 点）
+  # 也可以到 Actions 页面手动点一次，并顺手指定只跑哪一段
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "跑哪一段"
+        type: choice
+        default: all
+        options:
+          - all    # 签到 + 猫猫（整轮）
+          - cat    # 只收猫：领已到家的旅行积分，并该派就派新的一趟
 
 permissions:
   contents: read
@@ -23,9 +36,11 @@ jobs:
     # 那时 python3 版本、OpenSSL 策略都可能变，.latest 会静默换底。
     # 钉死 24.04 保证每天跑的是同一套环境；要升级时手动改这一行。
     runs-on: ubuntu-24.04
-    # 时间预算随账号数放大（脚本内 WB_BUDGET_SECONDS），这里留足余量。
+    # 时间预算随账号数放大（脚本内 WB_BUDGET_SECONDS = 420 + 150×(N-1)）。
+    # 这里必须**明显大于**脚本预算，否则 GitHub 会先一步把任务杀掉：
+    # 6 个账号时脚本预算是 1170s，20 分钟（1200s）只剩 30s 余量，太贴了。
     # 账号特别多时（比如 10 个以上）相应调大，或把账号拆成多个 workflow。
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       # v5 起用 Node 24；v4 是 Node 20，runner 上会打弃用告警并强制降级运行
       - uses: actions/checkout@v5
@@ -42,6 +57,10 @@ jobs:
 
       - name: 签到 + 派猫猫，并推送通知
         env:
+          # 触发的 cron（只有 schedule 事件有值）与手动触发时选的模式。
+          # 放进 env 再由脚本读，不要在 run 里插 ${{ }}——那等于把外部值拼进 shell。
+          TRIGGER_CRON: ${{ github.event.schedule }}
+          DISPATCH_MODE: ${{ inputs.mode }}
           # 多账号清单：JSON 数组，由本机刷新脚本注入（推荐）
           # [{"name":"我的账号","token":"...","uid":"...","domain":"www.workbuddy.cn"}]
           # 某个账号想只收自己的通知（不并进汇总卡片），在它的条目上加 notify，例如
@@ -59,6 +78,9 @@ jobs:
           # 可选：有账号 token 过期时不希望整轮算失败，就打开这行，
           # 变成「至少一个账号签到成功即算成功」。
           # WB_ALLOW_PARTIAL: "1"
+          # 可选：只收猫那几轮默认「有变化才推送」（免得一天推四遍「猫还在路上」），
+          # 想每轮都推就设 always。
+          # WB_NOTIFY_MODE: always
 
           # ============ 通知渠道（全局层）============
           # 下面的渠道「配了哪个就发哪个」。全都不配也不会报错，只是不发通知。
@@ -101,4 +123,20 @@ jobs:
           # 解释器路径不写死版本号，动态取当前 runner 上的 python3
           PYTHON_BIN="$(command -v python3)"
           echo "python: ${PYTHON_BIN} ($("${PYTHON_BIN}" -V 2>&1))"
-          "${PYTHON_BIN}" scripts/daily.py
+
+          # 跑哪一段：由**触发的 cron** 决定，手动触发则听 mode 输入。
+          # 这样改了 cron 就跑对应的那一段，不会出现「cron 改了、模式忘了改」。
+          MODE="all"
+          case "${TRIGGER_CRON:-}" in
+            "20 22,4,10 * * *") MODE="cat" ;;   # 只收猫那一档
+          esac
+          case "${DISPATCH_MODE:-}" in
+            all|cat) MODE="${DISPATCH_MODE}" ;;  # 手动触发时以选择为准
+          esac
+          echo "本次模式：${MODE}（触发 cron：'${TRIGGER_CRON:-无，手动触发}'）"
+
+          if [ "$MODE" = "cat" ]; then
+            "${PYTHON_BIN}" scripts/daily.py --cat-only
+          else
+            "${PYTHON_BIN}" scripts/daily.py
+          fi
