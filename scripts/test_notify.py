@@ -55,8 +55,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import daily  # noqa: E402
 
-SAMPLE_CHECKIN = "✅ 今日已签过（今日 100，连续 3 天，累计 300）"
-SAMPLE_CAT = ["🐾 猫咪：龙焰喵（SSR）", "🐱 猫猫旅行中：咖啡馆，约 6 分钟后回"]
+SAMPLE_CHECKIN = "✅ 今天已经签过了（今日 100 · 连续 3 天 · 累计 300）"
+SAMPLE_CAT = ["猫咪 龙焰喵（SSR）", "🐱 在路上 → 咖啡馆，约 6 分钟后回"]
 
 # 该渠道怎么拿凭据、怎么配安全设置
 HOWTO = {
@@ -226,15 +226,22 @@ def apply_cli(args: argparse.Namespace) -> None:
 
 
 def sample_sections(count: int) -> list[dict]:
+    """自检用的假内容。**结构要和真实推送一致**（含最上面那行总览），
+    这样「自检看到的样子」就是「上线后收到的样子」。
+
+    文案也跟着 daily.py 抄——它一改这里就该改，
+    否则等于「拿一个线上永远不会出现的样例去验证渠道」。
+    """
     names = ["我的账号", "小号", "同事的号", "账号4", "账号5"]
-    out = []
-    for i in range(max(1, count)):
+    n = max(1, count)
+    out: list[dict] = [{"head": "✅ 签到 %d/%d · 🐱 1 只在路上" % (n, n)}]
+    for i in range(n):
         out.append({
             "name": names[i] if i < len(names) else "账号%d" % (i + 1),
             "checkin": [SAMPLE_CHECKIN if i % 2 == 0
-                        else "✅ 签到成功，+100 积分（今日 100，连续 1 天）"],
+                        else "✅ 签到成功 +100 积分（今日 100 · 连续 1 天）"],
             "cat": SAMPLE_CAT if i % 2 == 0
-                   else ["🐾 猫咪：龙焰喵（SSR）", "🚀 派出猫猫去咖啡馆（1 小时后回）"],
+                   else ["猫咪 龙焰喵（SSR）", "🚀 派出猫猫 → 咖啡馆（1 小时后回）"],
         })
     return out
 

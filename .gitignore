@@ -27,3 +27,4 @@ __pycache__/
 .idea/
 .vscode/
 *.iml
+/accounts.local.json.back

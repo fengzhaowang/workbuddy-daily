@@ -267,8 +267,8 @@ def main() -> int:
         ok &= check("有收获 -> 推送 1 条", len(bodies("/push/ren")) == 1,
                     str(len(bodies("/push/ren"))))
         ok &= check("推送里写明领到多少积分",
-                    "领到已到家的旅行积分" in (bodies("/push/ren") or [""])[0],
-                    (bodies("/push/ren") or [""])[0][:120])
+                    "领到旅行积分 +" in (bodies("/push/ren") or [""])[0],
+                    (bodies("/push/ren") or [""])[0][:160])
 
         TRAVEL["state"], TRAVEL["record_id"] = "idle", None
         os.environ.pop("WB_ACCOUNTS", None)
@@ -315,7 +315,8 @@ def main() -> int:
 
         print("⑩ 延迟说明要进推送正文，且不许打乱账号编号")
         one = [{"name": "癸", "checkin_ok": True, "cat_ok": True,
-                "checkin": {"lines": ["✅ 已签"]}, "cat": {"lines": ["🐾 在路上"]},
+                "checkin": {"result": "ALREADY", "lines": ["✅ 已签"]},
+                "cat": {"result": "TRAVELING", "lines": ["🐾 在路上"]},
                 "_notify": {}, "_declared_notify": False, "_notify_problems": []}]
         os.environ["SERVERCHAN_KEY"] = base + "/push/sct2"
         SEEN.clear()
@@ -327,7 +328,7 @@ def main() -> int:
                     "1. 癸" not in (pushed[0] if pushed else ""),
                     (pushed[0] if pushed else "")[:120])
         card = json.dumps(daily.build_feishu_card(
-            "t", "e", daily._sections_of(one, "⏱ 说明占位"), True), ensure_ascii=False)
+            "标题", daily._sections_of(one, "⏱ 说明占位"), True), ensure_ascii=False)
         ok &= check("飞书卡片同样带说明、同样不编号",
                     "⏱ 说明占位" in card and "1. 癸" not in card and "🏠 **签到**" in card, "")
         os.environ.pop("SERVERCHAN_KEY", None)
@@ -377,6 +378,73 @@ def main() -> int:
         ok &= check("结果 JSON 里有 cron 段（计划 / 实际 / 延迟）",
                     isinstance(body["json"].get("cron"), dict)
                     and "actual_utc" in body["json"]["cron"], "")
+
+        print("⑫ 推送排版：换行要真的换行，内容要能一眼看懂")
+        # 各家对 markdown 换行的支持不一样（企微/钉钉/Server酱会把单个 \n 折叠掉），
+        # 而「会不会被折叠」可以精确判定：某一行后面紧跟另一个非空行、行尾又没补两个空格
+        # —— 这个换行在渲染时就消失了。这是本项目最容易踩、又最难自查的一类问题，
+        # 所以拿它当硬约束测出来（细节见 daily.py 里 NEWLINE_STYLES 的注释）。
+        def folded(text: str) -> int:
+            lines = text.split("\n")
+            return sum(1 for i, l in enumerate(lines[:-1])
+                       if l.strip() and lines[i + 1].strip() and not l.endswith("  "))
+
+        multi = [
+            {"name": "甲", "checkin_ok": True, "cat_ok": True,
+             "checkin": {"result": "ALREADY", "today_credit": 100,
+                         "lines": ["✅ 今天已经签过了（今日 100 · 连续 3 天 · 累计 300）"]},
+             "cat": {"result": "CLAIMED", "reward": 6,
+                     "lines": ["猫咪 龙焰喵（SSR）", "🎁 领到旅行积分 +6"]}},
+            {"name": "乙", "checkin_ok": False, "cat_ok": True,
+             "checkin": {"result": "AUTH", "lines": ["❌ 登录态失效（HTTP 401）"]},
+             "cat": {"result": "TRAVELING", "location": "图书馆",
+                     "lines": ["🐱 在路上 → 图书馆，约 6 分钟后回"]}},
+        ]
+        os.environ.pop("WB_PUSH_NEWLINE", None)
+        secs = daily._sections_of(multi)
+        body_md = daily._fmt_sections(secs)
+        ok &= check("markdown 正文里没有会被折叠掉的换行（企微/钉钉/Server酱的坑）",
+                    folded(body_md) == 0, "%d 处：%r" % (folded(body_md), body_md[:160]))
+        ok &= check("纯文本正文不掺行尾空格（那边的 \\n 本来就是硬换行）",
+                    "  \n" not in daily._fmt_sections(secs, md=False), "")
+        ok &= check("总览行说清结论、并点名是谁有问题",
+                    "✅ 签到 1/2" in body_md and "⚠️ 有问题：乙" in body_md, body_md[:120])
+        ok &= check("总览行报出「收了几趟」「几只在路上」",
+                    "🎁 收 1 趟积分" in body_md and "🐱 1 只在路上" in body_md, "")
+        ok &= check("多账号有编号、单账号不编号",
+                    "**1. 甲**" in body_md and "**2. 乙**" in body_md
+                    and "1. 甲" not in daily._fmt_sections(daily._sections_of(multi[:1])), "")
+        ok &= check("标题：多账号报人数、单账号报名字",
+                    daily._push_title(multi, "2026-10-09 10:49", "prod")
+                    == "Buddy 加油站日报 · 2 个账号 · 10-09 10:49"
+                    and daily._push_title(multi[:1], "2026-10-09 10:49", "prod")
+                    == "Buddy 加油站日报 · 甲 · 10-09 10:49",
+                    daily._push_title(multi, "2026-10-09 10:49", "prod"))
+
+        cat_only = [dict(multi[0], checkin={"result": "SKIPPED", "lines": ["（跳过）"]})]
+        ok &= check("收猫轮次的标题标明「收猫」",
+                    "收猫" in daily._push_title(cat_only, "2026-10-09 10:49", "prod"), "")
+        ok &= check("收猫轮次不显示「🏠 签到」空壳段、总览里也不提签到",
+                    "🏠" not in daily._fmt_sections(daily._sections_of(cat_only))
+                    and "签到" not in daily._overview(cat_only), "")
+        card = daily.build_feishu_card("t", secs, True)
+        card_texts = [f["text"]["content"]
+                      for el in card["card"]["elements"] if el.get("tag") == "div"
+                      for f in el.get("fields") or []]
+        ok &= check("飞书卡片走紧凑的 lark 风格（它认单换行），且不再塞开发者说明",
+                    any("🏠 **签到**\n" in t for t in card_texts)
+                    and any("✅ 签到 1/2" in t for t in card_texts)
+                    and "各账号互相隔离" not in json.dumps(card, ensure_ascii=False),
+                    str(card_texts)[:160])
+
+        os.environ["WB_PUSH_NEWLINE"] = "lf"
+        ok &= check("WB_PUSH_NEWLINE=lf 回到单换行（确认客户端认它时才用）",
+                    folded(daily._fmt_sections(secs)) > 0, "")
+        os.environ["WB_PUSH_NEWLINE"] = "blank"
+        blank = daily._fmt_sections(secs)
+        ok &= check("WB_PUSH_NEWLINE=blank 全部用空行（最保守，一定换行）",
+                    folded(blank) == 0 and "\n\n" in blank and "  \n" not in blank, "")
+        os.environ.pop("WB_PUSH_NEWLINE", None)
 
         os.environ.pop("WB_ACCOUNTS", None)
         TRAVEL["state"], TRAVEL["record_id"] = "idle", None

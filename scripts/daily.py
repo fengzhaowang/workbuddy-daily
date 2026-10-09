@@ -548,14 +548,19 @@ def _num(v: Any) -> Any:
 
 # ================= 第 1 段：加油站签到 =================
 def do_checkin(api: Api, dry_run: bool = False) -> dict:
+    """签到段。
+
+    每行文本都是**发给手机通知**看的，所以刻意写得短：
+    「怎么做」这类步骤留在 README/日志里，通知里只说「发生了什么」。
+    """
     code, body = api.call(P_CHECKIN_STATUS, "POST", {}, retry=True)
     if code == -1:
         return {"ok": False, "segment": "签到", "result": "NETWORK",
-                "lines": ["❌ 网络不可达，未拿到签到状态（%s）" % body.get("error", "")]}
+                "lines": ["❌ 网络不可达，没拿到签到状态（%s）" % body.get("error", "")]}
     if code in (401, 403):
         return {"ok": False, "segment": "签到", "result": "AUTH",
-                "lines": ["❌ 鉴权失败（HTTP %s）：该账号的 token 可能已过期，"
-                          "请在本机重跑刷新脚本导出新 token" % code]}
+                "lines": ["❌ 登录态失效（HTTP %s）：该账号的 token 已过期，"
+                          "需在本机重新导出" % code]}
     if not is_ok(code, body):
         return {"ok": False, "segment": "签到", "result": "ERROR",
                 "lines": ["❌ 签到状态接口异常（HTTP %s%s）"
@@ -568,21 +573,23 @@ def do_checkin(api: Api, dry_run: bool = False) -> dict:
 
     if st.get("today_checked_in") in (True, 1):
         return {"ok": True, "segment": "签到", "result": "ALREADY",
-                "lines": ["✅ 今日已签过" + _status_tail(st)]}
+                "credit": None, "today_credit": _num(st.get("today_credit")),
+                "lines": ["✅ 今天已经签过了" + _status_tail(st)]}
 
     if dry_run:
         return {"ok": True, "segment": "签到", "result": "DRY_RUN",
-                "lines": ["🔎 dry-run：今日未签，跳过领取"]}
+                "credit": None, "today_credit": _num(st.get("today_credit")),
+                "lines": ["🔎 dry-run：今天还没签，本次不领"]}
 
     # 领取接口虽然写数据，但本身幂等（当天重复领取只会返回「已签」，不会再发一次积分），
     # 所以允许重试；其余写操作一律不重试，避免超时发生在服务端已处理完之后造成重复提交。
     code2, body2 = api.call(P_CHECKIN_CLAIM, "POST", {}, retry=True)
     if code2 == -1:
         return {"ok": False, "segment": "签到", "result": "NETWORK",
-                "lines": ["❌ 领取请求未能送达，请下次重试"]}
+                "lines": ["❌ 领取请求没送达，下次会重试"]}
     if code2 in (401, 403):
         return {"ok": False, "segment": "签到", "result": "AUTH",
-                "lines": ["❌ 鉴权失败（HTTP %s）" % code2]}
+                "lines": ["❌ 登录态失效（HTTP %s），签到未完成" % code2]}
 
     if is_ok(code2, body2):
         got = data_of(body2)
@@ -590,11 +597,13 @@ def do_checkin(api: Api, dry_run: bool = False) -> dict:
         fresh = data_of(body3) if is_ok(c3, body3) else st
         credit = got.get("credit", fresh.get("today_credit"))
         return {"ok": True, "segment": "签到", "result": "CLAIMED",
-                "lines": ["✅ 签到成功，+%s 积分%s" % (_num(credit), _status_tail(fresh))]}
+                "credit": _num(credit), "today_credit": _num(fresh.get("today_credit")),
+                "lines": ["✅ 签到成功 +%s 积分%s" % (_num(credit), _status_tail(fresh))]}
 
     if isinstance(body2, dict) and body2.get("code") == CODE_ALREADY_CHECKED_IN:
         return {"ok": True, "segment": "签到", "result": "ALREADY",
-                "lines": ["✅ 今日已签过（服务端判定已领取）" + _status_tail(st)]}
+                "credit": None, "today_credit": _num(st.get("today_credit")),
+                "lines": ["✅ 今天已经签过了（服务端判定已领取）" + _status_tail(st)]}
 
     return {"ok": False, "segment": "签到", "result": "ERROR",
             "lines": ["❌ 签到失败（HTTP %s%s）"
@@ -602,7 +611,11 @@ def do_checkin(api: Api, dry_run: bool = False) -> dict:
 
 
 def _status_tail(st: Any) -> str:
-    """把状态里的积分/连签信息拼成一句尾巴。"""
+    """把状态里的积分/连签信息拼成一句尾巴。
+
+    用「·」而不是逗号：一行里塞三个数字时，逗号会跟中文句子糊在一起，
+    分隔符能让人一眼看出这是并列的三个数。
+    """
     if not isinstance(st, dict):
         return ""
     bits = []
@@ -611,7 +624,7 @@ def _status_tail(st: Any) -> str:
         v = st.get(key)
         if v is not None:
             bits.append("%s %s%s" % (label, _num(v), unit))
-    return "（%s）" % "，".join(bits) if bits else ""
+    return "（%s）" % " · ".join(bits) if bits else ""
 
 
 # ================= 第 2 段：猫猫旅行 =================
@@ -619,6 +632,10 @@ def do_cat(api: Api, dry_run: bool = False) -> dict:
     """先领已到家的旅行积分，再看今日名额决定派不派新的一趟。
 
     整段被 try 兜住：任何异常都只记进本段结论，不影响签到。
+
+    `lines` 是给人看的（会进通知正文），另外几个字段是给程序看的——
+    buddy / reward / departed / location，总览行直接读它们，
+    不去解析人看的文本（文案随时会改，解析文本的方案一改就坏）。
     """
     seg: dict = {"ok": True, "segment": "猫猫旅行", "result": "IDLE", "lines": []}
     try:
@@ -628,20 +645,23 @@ def do_cat(api: Api, dry_run: bool = False) -> dict:
                     "lines": ["⚠️ 网络不可达，本段跳过（%s）" % body.get("error", "")]}
         if code in (401, 403):
             return {"ok": False, "segment": "猫猫旅行", "result": "AUTH",
-                    "lines": ["⚠️ 鉴权失败（HTTP %s），本段跳过" % code]}
+                    "lines": ["⚠️ 登录态失效（HTTP %s），本段跳过" % code]}
         if not is_ok(code, body):
             return {"ok": False, "segment": "猫猫旅行", "result": "ERROR",
                     "lines": ["⚠️ 旅行状态接口异常（HTTP %s%s），本段跳过"
                               % (code, "：" + msg_of(body) if msg_of(body) else "")]}
 
-        seg["lines"].append("🐾 猫咪：%s" % _buddy_name(api))
+        buddy = _buddy_name(api)
+        if buddy:
+            seg["buddy"] = buddy
+            seg["lines"].append("猫咪 %s" % buddy)
         st = data_of(body)
         claimed = False
 
         # ---- ① 先领掉「已到家」那一趟的旅行积分 ----
         if _arrived(st):
             if dry_run:
-                seg["lines"].append("🎁 有一趟已到家的积分待领（dry-run 不领）")
+                seg["lines"].append("🎁 有一趟已到家的积分待领（dry-run 没领）")
             else:
                 # 带上 record_id：服务端目前对空 body 也接受（实测同样返回 not arrived yet），
                 # 但明确的契约是认 record_id，带上更稳妥。
@@ -650,7 +670,8 @@ def do_cat(api: Api, dry_run: bool = False) -> dict:
                 c, cb = api.call(P_TRAVEL_CLAIM, "POST", payload)
                 if is_ok(c, cb):
                     reward = data_of(cb).get("reward_credit", st.get("reward_credit"))
-                    seg["lines"].append("🎁 领到已到家的旅行积分 +%s" % _num(reward))
+                    seg["reward"] = _num(reward)
+                    seg["lines"].append("🎁 领到旅行积分 +%s" % _num(reward))
                     seg["result"] = "CLAIMED"
                     claimed = True
                     c2, body = api.call(P_TRAVEL_STATUS, "GET", retry=True)
@@ -659,21 +680,21 @@ def do_cat(api: Api, dry_run: bool = False) -> dict:
                     seg["ok"] = False
                     seg["result"] = "CLAIM_FAILED"
                     seg["lines"].append(
-                        "⚠️ 领取旅行积分失败（HTTP %s%s），本次不派新的一趟，"
-                        "避免覆盖尚未领取的奖励" % (c, "：" + msg_of(cb) if msg_of(cb) else ""))
+                        "⚠️ 领取旅行积分失败（HTTP %s%s），本次没派新的"
+                        % (c, "：" + msg_of(cb) if msg_of(cb) else ""))
                     return seg
-        elif _traveling(st):
-            pass  # 还在路上，没什么可领
-        else:
-            seg["lines"].append("ℹ️ 没有待领取的旅行积分")
+        # 「既没到家、也没在路上」= 今天还没派过，这是常态，不占一行。
+        # 通知里每多一句废话，真正的异常就多一分被忽略的概率。
 
         # ---- ② 再判断能不能派新的一趟 ----
         if _traveling(st):
-            seg["lines"].append("🐱 猫猫旅行中：%s%s"
-                                % (_loc_name(st), _eta(st.get("arrive_at"), st.get("server_now"))))
+            seg["location"] = _loc_name(st)
+            seg["lines"].append("🐱 在路上 → %s%s"
+                                % (seg["location"],
+                                   _eta(st.get("arrive_at"), st.get("server_now"))))
             seg["result"] = "TRAVELING"
         elif st.get("daily_limit_reached"):
-            seg["lines"].append("🛑 今日派发名额已用完（今天已经派过了），不再派新的一趟")
+            seg["lines"].append("🛑 今天已经派过了（每天一趟）")
             seg["result"] = "LIMIT"
         elif dry_run:
             seg["lines"].append("🔎 dry-run：可以派新的一趟，本次不派")
@@ -684,7 +705,7 @@ def do_cat(api: Api, dry_run: bool = False) -> dict:
             if not locs or not isinstance(locs[0], dict) or locs[0].get("id") is None:
                 seg["ok"] = False
                 seg["result"] = "NO_LOCATION"
-                seg["lines"].append("⚠️ 没取到可选目的地（HTTP %s），本次不派" % c)
+                seg["lines"].append("⚠️ 没取到可选目的地（HTTP %s），本次没派" % c)
                 return seg
             loc = locs[0]
             d, db = api.call(P_TRAVEL_DEPART, "POST", {"location_id": loc.get("id")})
@@ -692,19 +713,20 @@ def do_cat(api: Api, dry_run: bool = False) -> dict:
                 new = data_of(db)
                 name = (new.get("location") or {}).get("name") or loc.get("name") or "?"
                 dur = new.get("duration_hours") or loc.get("duration_hours_min") or "?"
-                seg["lines"].append("🚀 派出猫猫去%s（%s 小时后回）" % (name, dur))
+                seg["departed"] = name
+                seg["lines"].append("🚀 派出猫猫 → %s（%s 小时后回）" % (name, dur))
                 seg["result"] = "DEPARTED"
             else:
                 # 4xx 多为业务规则（活动结束、名额变化），不该跟 5xx/网络故障一样当成"要人管"。
                 hard = _is_hard_failure(d)
                 seg["ok"] = not hard
                 seg["result"] = "DEPART_FAILED" if hard else "DEPART_REJECTED"
-                seg["lines"].append("%s 派猫未成功（HTTP %s%s）"
+                seg["lines"].append("%s 派猫没成功（HTTP %s%s）"
                                     % ("⚠️" if hard else "ℹ️", d,
                                        "：" + msg_of(db) if msg_of(db) else ""))
 
         if claimed and seg["result"] == "CLAIMED":
-            seg["lines"].append("ℹ️ 只领了积分，本次没有派新的一趟")
+            seg["lines"].append("ℹ️ 本次只领到积分，没派新的一趟")
         return seg
     except Exception as e:  # noqa: BLE001 - 需求：猫猫挂了不能影响签到
         return {"ok": False, "segment": "猫猫旅行", "result": "EXCEPTION",
@@ -774,16 +796,20 @@ def _eta(arrive_at: Any, server_now: Any) -> str:
 
 
 def _buddy_name(api: Api) -> str:
+    """猫猫的名字 + 稀有度，例如「龙焰喵（SSR）」。
+
+    取不到就返回空串，由调用方整行不显示——写「（资料未取到）」
+    对读通知的人没有任何价值，只是多占一行。
+    """
     c, body = api.call(P_BUDDY_INFO, "GET", retry=True)
     if is_ok(c, body):
         b = data_of(body).get("buddy") or {}
         if b.get("name"):
             return "%s（%s）" % (b["name"], b.get("rarity") or "?")
-    return "（资料未取到）"
+    return ""
 
 
 # ================= 推送 =================
-NOTE_TEXT = "各账号互相隔离 · 猫猫段失败不影响该账号签到结论 · 由 GitHub Actions 定时执行"
 
 # 支持的推送渠道。没配 NOTIFY_CHANNELS 时按这个顺序自动探测：
 # 哪个渠道的 secret 配了，就发哪个；配了几个就发几个。
@@ -1028,82 +1054,151 @@ def account_channels(acc: Account) -> tuple[dict, list[str]]:
 LAST_TRACE: list[dict] = []
 
 
-def _lines_to_md(lines: list[str]) -> str:
-    return "\n".join(l for l in lines if l).strip() or "（无输出）"
+def _lines_to_md(lines: list[str], nl: str = "\n") -> str:
+    return nl.join(l for l in lines if l).strip() or "（无输出）"
 
 
-def _lines_to_plain(lines: list[str]) -> str:
+def _lines_to_plain(lines: list[str], nl: str = "\n") -> str:
     """去掉 markdown 记号，给只认纯文本的渠道（Bark / ntfy / 邮件）。"""
-    return "\n".join(re.sub(r"\*\*|<[^>]+>", "", l)
-                     for l in lines if l).strip() or "（无输出）"
+    return nl.join(re.sub(r"\*\*|<[^>]+>", "", l) for l in lines if l).strip() or "（无输出）"
 
 
-def _fmt_sections(sections: list[dict], md: bool = True) -> str:
-    """把各账号拼成一段文本：每个账号一块，块内「签到」「猫猫」分行。
+# 段内换行 / 段间换行。**别把这里改回单个 "\n"**：
+#   * 企业微信 markdown：实测单个 \n 不换行，必须 \n\n（且 \n\n 不会多出空行）；
+#   * 钉钉 markdown：官方 FAQ「换行格式：\n，重要：\n 前后各两个空格」，
+#     社区实测 \n\n 兼容性最好；
+#   * Server酱 / PushPlus：走 markdown 渲染，单个 \n 属软换行，同样会被折叠；
+#   * 飞书卡片（lark_md）：单个 \n 就是换行，最紧凑，不必空行；
+#   * Bark / ntfy / Telegram / 邮件：纯文本，\n 本身就是硬换行。
+# 所以「一份内容发给 9 个渠道」不能只有一个 "\n"。手机上看着还是挤成一行时，
+# 不用改代码：设 WB_PUSH_NEWLINE=lf（回单换行）或 space（行尾两空格）即可。
+NEWLINE_STYLES: dict[str, tuple[str, str]] = {
+    "space": ("  \n", "\n\n"),      # 默认：段内行尾两空格（markdown 硬换行，钉钉官方写法），段间空行
+    "blank": ("\n\n", "\n\n"),      # 最保守：全用空行。渲染器不认行尾空格时用它
+    "lf": ("\n", "\n\n"),           # 单换行：确认客户端认它时才用（最紧凑）
+    "lark": ("\n", "\n\n"),         # 飞书卡片 lark_md
+}
+DEFAULT_NEWLINE = "space"
 
-    `{"note": "…"}` 这种条目不占账号编号，渲染成末尾一行说明。
+
+def _newlines(md: bool, style: str = "") -> tuple[str, str]:
+    """返回 (段内换行符, 段间换行符)。纯文本渠道固定 \\n，不参与上面的取舍。"""
+    if not md:
+        return "\n", "\n\n"
+    mode = (style or os.environ.get("WB_PUSH_NEWLINE") or DEFAULT_NEWLINE).strip().lower()
+    return NEWLINE_STYLES.get(mode, NEWLINE_STYLES[DEFAULT_NEWLINE])
+
+
+# 两个段落的显示名。冒号后面就是正文，段标题单独一行、加了粗，
+# 扫一眼就知道哪几行说的是签到、哪几行说的是猫猫。
+_SEGMENTS = (("🏠", "checkin", "签到"), ("🐾", "cat", "猫猫"))
+
+
+def _account_block(s: dict, multi: bool, idx: int, md: bool,
+                   inner: str, para: str) -> str:
+    """一个账号的正文块：标题 + 「🏠 签到」段 +「🐾 猫猫」段。
+
+    某一段没有内容（例如收猫轮次跳过了签到）就整段不渲染——
+    留个空标题比不写更难读。
+    """
+    name = s.get("name") or "?"
+    if multi:
+        head = "**%d. %s**" % (idx, name) if md else "%d. %s" % (idx, name)
+    else:
+        head = "**%s**" % name if md else name
+
+    parts = [head]
+    for label, key, seg_name in _SEGMENTS:
+        lines = s.get(key) or []
+        if not lines:
+            continue
+        body = _lines_to_md(lines, inner) if md else _lines_to_plain(lines, inner)
+        # 段标题与它自己的内容之间用 inner（贴着），段与段之间才用 para（空行）：
+        # 「哪几行属于猫猫」靠贴在一起就够了，不必每段前后都空一行——那样正文会翻倍长。
+        parts.append("%s %s%s%s" % (label, "**%s**" % seg_name if md else seg_name, inner, body))
+    return para.join(parts)
+
+
+def _fmt_sections(sections: list[dict], md: bool = True, style: str = "") -> str:
+    """把各账号拼成一段正文。
+
+    结构：总览（可选）→ 各账号块 → 末尾说明（可选）。
+    `{"head": "…"}` 不占账号编号、排在开头；`{"note": "…"}` 同样不占编号、排在末尾。
     编号只看账号条目——否则「只有 1 个账号 + 1 行说明」会被编成「1. 张三」，
     看着像多账号。
     """
-    multi = len([s for s in sections if not s.get("note")]) > 1
-    blocks = []
+    inner, para = _newlines(md, style)
+    accounts = [s for s in sections if not (s.get("head") or s.get("note"))]
+    multi = len(accounts) > 1
+
+    blocks: list[str] = []
+    for s in sections:
+        if s.get("head"):
+            blocks.append(s["head"])
     idx = 0
+    for s in sections:
+        if s.get("head") or s.get("note"):
+            continue
+        idx += 1
+        blocks.append(_account_block(s, multi, idx, md, inner, para))
     for s in sections:
         if s.get("note"):
             blocks.append(s["note"])
-            continue
-        idx += 1
-        if multi:
-            head = "**%d. %s**" % (idx, s["name"]) if md else "%d. %s" % (idx, s["name"])
-        else:
-            head = "**%s**" % s["name"] if md else s["name"]
-        ck = _lines_to_md(s.get("checkin") or []) if md else _lines_to_plain(s.get("checkin") or [])
-        ct = _lines_to_md(s.get("cat") or []) if md else _lines_to_plain(s.get("cat") or [])
-        if md:
-            blocks.append("%s\n🏠 **签到**\n%s\n🐾 **猫猫**\n%s" % (head, ck, ct))
-        else:
-            blocks.append("%s\n🏠 签到\n%s\n🐾 猫猫\n%s" % (head, ck, ct))
-    return "\n\n".join(blocks)
+    return para.join(b for b in blocks if b)
 
 
-def build_feishu_card(stamp: str, env: str, sections: list[dict],
-                      ok: bool, secret: str = "") -> dict:
+def build_feishu_card(title: str, sections: list[dict], ok: bool, secret: str = "") -> dict:
     """构造飞书自定义机器人的交互卡片。
 
-    多账号：每个账号一个分区，分区内「🏠 签到」「🐾 猫猫」分行写清；
-    单账号时 structure 一样，只是只有一个分区。
+    多账号：每个账号一个分区（hr 隔开），分区内「🏠 签到」「🐾 猫猫」分行写清。
+    飞书卡片的 lark_md 单个 \\n 就换行，所以这里用最紧凑的 lark 风格——
+    不必像企微/钉钉那样拿空行换行。
 
     单独抽出来是为了让自检脚本（scripts/test_notify.py）走**同一条**发送路径，
     避免「自检能通、线上不通」这种最难查的偏差。
 
     sections: [{"name": str, "checkin": [lines], "cat": [lines]}, ...]
-             末尾可附 {"note": str}：不占编号，单独一行说明（与 _fmt_sections 一致）
+              可含 {"head": str}（排最前）与 {"note": str}（排最后），都不占编号。
     """
+    inner, para = _newlines(True, "lark")
     elements: list[dict] = []
-    multi = len([s for s in sections if not s.get("note")]) > 1
+    accounts = [s for s in sections if not (s.get("head") or s.get("note"))]
+    multi = len(accounts) > 1
+
+    for s in sections:
+        if s.get("head"):
+            elements.append({"tag": "div", "fields": [
+                {"is_short": False, "text": {"tag": "lark_md", "content": s["head"]}}]})
+
     idx = 0
     for s in sections:
-        if s.get("note"):
-            elements.append({"tag": "div", "fields": [
-                {"is_short": False,
-                 "text": {"tag": "lark_md", "content": s["note"]}}]})
+        if s.get("head") or s.get("note"):
             continue
         idx += 1
         if elements:
             elements.append({"tag": "hr"})
         head = "**%d. %s**" % (idx, s["name"]) if multi else "**%s**" % s["name"]
-        content = "%s\n🏠 **签到**\n%s\n🐾 **猫猫**\n%s" % (
-            head, _lines_to_md(s.get("checkin") or []), _lines_to_md(s.get("cat") or []))
+        parts = [head]
+        for label, key, seg_name in _SEGMENTS:
+            lines = s.get(key) or []
+            if not lines:
+                continue
+            parts.append("%s **%s**%s%s" % (label, seg_name, inner,
+                                            _lines_to_md(lines, inner)))
         elements.append({"tag": "div", "fields": [
-            {"is_short": False, "text": {"tag": "lark_md", "content": content}}]})
-    elements.append({"tag": "note", "elements": [
-        {"tag": "plain_text", "content": NOTE_TEXT}]})
+            {"is_short": False, "text": {"tag": "lark_md", "content": para.join(parts)}}]})
+
+    # note 是卡片底部的小字，里面不能带 markdown 记号（那边不解析）
+    for s in sections:
+        if s.get("note"):
+            elements.append({"tag": "note", "elements": [
+                {"tag": "plain_text",
+                 "content": re.sub(r"\*\*|<[^>]+>", "", s["note"]).strip()}]})
 
     card = {
         "config": {"wide_screen_mode": True},
         "header": {"template": "green" if ok else "orange",
-                   "title": {"tag": "plain_text",
-                             "content": "Buddy 加油站日报 · %s · %s" % (stamp, env)}},
+                   "title": {"tag": "plain_text", "content": title}},
         "elements": elements,
     }
     payload: dict = {"msg_type": "interactive", "card": card}
@@ -1119,10 +1214,10 @@ def build_feishu_card(stamp: str, env: str, sections: list[dict],
     return payload
 
 
-def push_feishu(webhook: str, stamp: str, env: str, sections: list[dict],
+def push_feishu(webhook: str, title: str, sections: list[dict],
                 ok: bool, secret: str = "") -> str:
     """飞书自定义机器人：一张卡片，账号分区、签到与猫猫分行写清。"""
-    return _post_json(webhook, build_feishu_card(stamp, env, sections, ok, secret), "飞书")
+    return _post_json(webhook, build_feishu_card(title, sections, ok, secret), "飞书")
 
 
 def push_wecom(webhook: str, sections: list[dict], title: str) -> str:
@@ -1322,7 +1417,7 @@ def _dispatch(ch: str, cfg: dict, stamp: str, env: str, title: str,
     """
     try:
         if ch == "feishu":
-            return push_feishu(cfg["webhook"], stamp, env, sections, ok,
+            return push_feishu(cfg["webhook"], title, sections, ok,
                                cfg.get("secret") or "")
         if ch == "wecom":
             return push_wecom(cfg["webhook"], sections, title)
@@ -1341,7 +1436,7 @@ def _dispatch(ch: str, cfg: dict, stamp: str, env: str, title: str,
         if ch == "email":
             return push_email(cfg["host"], int(cfg.get("port") or 465), cfg["user"],
                               cfg.get("pass") or "", cfg.get("to") or cfg["user"],
-                              "[Buddy加油站] %s · %s" % (stamp, env),
+                              title,
                               "%s\n\n%s" % (title, _fmt_sections(sections, md=False)))
     except Exception as ex:  # noqa: BLE001
         return "%s推送失败：%s" % (CHANNEL_LABEL.get(ch, ch), ex)
@@ -1388,14 +1483,91 @@ def _public(obj: Any) -> Any:
     return obj
 
 
-def _sections_of(results: list[dict], note: str = "") -> list[dict]:
-    """账号分区列表；note 非空时在末尾附加一行说明（不占账号编号）。
+def _seg_result(r: dict, seg: str) -> str:
+    """读某一段的结论字面量。缺键一律当空串——
+    这几个函数只用来排版，不该因为少一个键就把整轮推送炸掉。"""
+    return str(((r.get(seg) or {}).get("result")) or "")
 
-    说明行用来放「本轮因为 GitHub 定时器延迟才 5 点发出来」这类话——
-    收到通知的人第一反应就是「怎么这个点发」，正文里答掉它，省一次困惑。
+
+def _account_ok(r: dict) -> bool:
+    """该账号本轮算不算成功。
+
+    只收猫的轮次签到段恒为 SKIPPED，拿它当门槛等于「必然失败」，
+    所以此时看猫猫段；整轮则看签到（猫猫段炸了不影响签到结论，这是需求）。
     """
-    secs = [{"name": r["name"], "checkin": r["checkin"]["lines"],
-             "cat": r["cat"]["lines"]} for r in results]
+    if _seg_result(r, "checkin") == "SKIPPED":
+        return bool(r.get("cat_ok"))
+    return bool(r.get("checkin_ok"))
+
+
+def _is_cat_only(results: list[dict]) -> bool:
+    return bool(results) and all(_seg_result(r, "checkin") == "SKIPPED" for r in results)
+
+
+def _overview(results: list[dict]) -> str:
+    """一行总览。
+
+    收到通知的人第一件事是「有没有事要我管」，而不是逐行读六个账号。
+    所以这行只报结论：签到几个成了、领到几趟积分、派出几趟、谁有问题。
+    常态的事只给个数，不铺开。
+    """
+    n = len(results)
+    cat_only = _is_cat_only(results)
+    bad_ck = [r["name"] for r in results
+              if _seg_result(r, "checkin") != "SKIPPED" and not r.get("checkin_ok")]
+    bad_ct = [r["name"] for r in results if not r.get("cat_ok")]
+    got = sum(1 for r in results if (r.get("cat") or {}).get("reward") is not None)
+    dep = sum(1 for r in results if (r.get("cat") or {}).get("departed"))
+    trav = sum(1 for r in results if _seg_result(r, "cat") == "TRAVELING")
+
+    bits: list[str] = []
+    if not cat_only:
+        bits.append("✅ 签到 %d/%d" % (n - len(bad_ck), n))
+    if got:
+        bits.append("🎁 收 %d 趟积分" % got)
+    if dep:
+        bits.append("🚀 派出 %d 趟" % dep)
+    if trav:
+        bits.append("🐱 %d 只在路上" % trav)
+
+    problems = bad_ck + [x for x in bad_ct if x not in bad_ck]
+    if problems:
+        bits.insert(0, "⚠️ 有问题：%s" % "、".join(problems))
+    return " · ".join(bits) or "没什么变化"
+
+
+def _push_title(results: list[dict], stamp: str, env: str) -> str:
+    """通知标题。手机通知栏只给一行，所以按「这份是发给谁看的」来定制：
+
+    * 单账号（各人收自己那份）→ 把名字写上去，一眼知道是谁的结果；
+    * 多账号（汇总卡片）→ 说清一共几个账号；
+    * 只收猫那几轮 → 标明「收猫」，否则半夜收到一个「日报」会莫名其妙。
+    """
+    who = results[0]["name"] if len(results) == 1 else "%d 个账号" % len(results)
+    kind = "收猫" if _is_cat_only(results) else "日报"
+    # stamp 是「2026-10-09 10:49」，标题里只留「10-09 10:49」（完整日期占地方、信息重复）
+    short = stamp[5:] if len(stamp) >= 16 else stamp
+    title = "Buddy 加油站%s · %s · %s" % (kind, who, short)
+    if env and env != "prod":
+        title += " [%s]" % env
+    return title
+
+
+def _sections_of(results: list[dict], note: str = "") -> list[dict]:
+    """推送内容：一条总览 + 各账号块 + 末尾说明（都不占账号编号）。
+
+    * 只收猫的轮次里签到段是跳过的，那一段整段不渲染——
+      留一个「🏠 签到 ⏱ 本轮跳过」的空壳只会让正文更长；
+    * note 用来放「本轮因为 GitHub 定时器延迟才 5 点发出来」这类话：
+      收到通知的人第一反应就是「怎么这个点发」，正文里答掉它，省一次困惑。
+    """
+    secs: list[dict] = [{"head": _overview(results)}]
+    for r in results:
+        checkin = (r.get("checkin") or {}).get("lines") or []
+        if _seg_result(r, "checkin") == "SKIPPED":
+            checkin = []                    # 只收猫的轮次：不显示「🏠 签到」段
+        secs.append({"name": r["name"], "checkin": checkin,
+                     "cat": (r.get("cat") or {}).get("lines") or []})
     if note:
         secs.append({"note": note})
     return secs
@@ -1412,9 +1584,9 @@ def _has_news(results: list[dict]) -> bool:
     所以那几轮默认只在有变化时才推送（--notify-mode always 可改回每次都推）。
     """
     for r in results:
-        if r["cat"]["result"] not in _QUIET_CAT_RESULTS:
+        if _seg_result(r, "cat") not in _QUIET_CAT_RESULTS:
             return True
-        if r["checkin"]["result"] != "SKIPPED" and not r["checkin_ok"]:
+        if _seg_result(r, "checkin") != "SKIPPED" and not r.get("checkin_ok"):
             return True
     return False
 
@@ -1431,9 +1603,8 @@ def notify(results: list[dict], stamp: str, env: str, note: str = "") -> list[st
     """
     notices: list[str] = []
     shared: list[dict] = []
-    title = "Buddy 加油站日报 · %s · %s" % (stamp, env)
 
-    # ① 各人发自己的
+    # ① 各人发自己的（标题带上他自己的名字，通知栏一眼能认出是谁的结果）
     for r in results:
         for p in (r.get("_notify_problems") or []):
             notices.append("%s（通知）：%s" % (r["name"], p))
@@ -1447,7 +1618,8 @@ def notify(results: list[dict], stamp: str, env: str, note: str = "") -> list[st
         secs = _sections_of([r], note)
         for ch, cfg in resolved.items():
             notices.append("%s → %s" % (r["name"], _dispatch(
-                ch, cfg, stamp, env, title, secs, r["checkin_ok"])))
+                ch, cfg, stamp, env, _push_title([r], stamp, env), secs,
+                _account_ok(r))))
 
     # ② 没人认领的账号汇总成一份，发到全局渠道
     if shared:
@@ -1462,7 +1634,8 @@ def notify(results: list[dict], stamp: str, env: str, note: str = "") -> list[st
                 "详见 README「通知渠道」一节）" % (who, len(shared)))
         else:
             secs = _sections_of(shared, note)
-            ok = all(r["checkin_ok"] for r in shared)
+            ok = all(_account_ok(r) for r in shared)
+            title = _push_title(shared, stamp, env)
             for ch in channels:
                 notices.append(_dispatch(ch, _env_cfg(ch), stamp, env, title, secs, ok))
 
