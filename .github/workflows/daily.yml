@@ -16,7 +16,7 @@ on:
     - cron: "20 0 * * *"          # ① 整轮
       timezone: 'Asia/Shanghai' # 注意这里
     - cron: "20 6,12,18 * * *"     # ② 只收猫（北京 6/12/18 点）
-    - timezone: 'Asia/Shanghai' # 注意这里
+      timezone: 'Asia/Shanghai' # 注意这里
   # 也可以到 Actions 页面手动点一次，并顺手指定只跑哪一段
   workflow_dispatch:
     inputs:
