@@ -17,7 +17,7 @@ on:
       timezone: 'Asia/Shanghai' # 注意这里
     - cron: "20 6,12,18 * * *"     # ② 只收猫（北京 6/12/18 点）
       timezone: 'Asia/Shanghai' # 注意这里
-  # 也可以到 Actions 页面手动点一次，并顺手指定只跑哪一段
+  # 也可以到 Actions 页面手动点一次，并顺手指定只跑哪一段、要不要照推
   workflow_dispatch:
     inputs:
       mode:
@@ -27,6 +27,13 @@ on:
         options:
           - all    # 签到 + 猫猫（整轮）
           - cat    # 只收猫：领已到家的旅行积分，并该派就派新的一趟
+      notify:
+        description: "推送策略"
+        type: choice
+        default: always
+        options:
+          - always    # 不看有没有变化，都推（手动点一次通常就是想立刻看到结果）
+          - onchange  # 只在有变化时推（定时任务的默认行为）
 
 permissions:
   contents: read
@@ -71,6 +78,7 @@ jobs:
           # 放进 env 再由脚本读，不要在 run 里插 ${{ }}——那等于把外部值拼进 shell。
           TRIGGER_CRON: ${{ github.event.schedule }}
           DISPATCH_MODE: ${{ inputs.mode }}
+          DISPATCH_NOTIFY: ${{ inputs.notify }}
           # 多账号清单：JSON 数组，由本机刷新脚本注入（推荐）
           # [{"name":"我的账号","token":"...","uid":"...","domain":"www.workbuddy.cn"}]
           # 某个账号想只收自己的通知（不并进汇总卡片），在它的条目上加 notify，例如
@@ -88,8 +96,9 @@ jobs:
           # 可选：有账号 token 过期时不希望整轮算失败，就打开这行，
           # 变成「至少一个账号签到成功即算成功」。
           # WB_ALLOW_PARTIAL: "1"
-          # 可选：只收猫那几轮默认「有变化才推送」（免得一天推四遍「猫还在路上」），
-          # 想每轮都推就设 always。
+          # 可选：推送策略。默认 onchange = 只在有变化时推，而且**逐人裁**：
+          # 今天已经签过、已经派过猫、积分也领过的人，这一轮不会再被推一次。
+          # 想每轮都推（不看有没有变化）就设 always。
           # WB_NOTIFY_MODE: always
           # 可选：推送正文的换行风格。默认 space = 行尾补两个空格换行
           # （markdown 硬换行，也是钉钉官方推荐的写法）；手机上要是还看着挤成一行，
@@ -143,4 +152,5 @@ jobs:
           # 手动触发时以 mode 输入为准，其余情况传 auto。
           # 这里刻意不再写一份 cron -> 模式 的 case：两处各写一份，
           # 改了一处忘了另一处，就是「看起来正常、其实没跑对」的静默错。
-          "${PYTHON_BIN}" scripts/daily.py --mode "${DISPATCH_MODE:-auto}"
+          "${PYTHON_BIN}" scripts/daily.py --mode "${DISPATCH_MODE:-auto}" \
+                                          --notify-mode "${DISPATCH_NOTIFY:-auto}"

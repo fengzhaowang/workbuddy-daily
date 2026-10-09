@@ -33,6 +33,8 @@ import daily  # noqa: E402
 SEEN: list[dict] = []          # 假服务端收到的每一次请求
 # 猫猫旅行状态可切换，用来演「还在路上」和「已到家」两种情形
 TRAVEL: dict = {"state": "idle", "record_id": None}
+# 签到状态可切换：演「今天还没签」和「今天已经签过」两种情形
+CHECKIN: dict = {"today_checked_in": False}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -62,7 +64,8 @@ class Handler(BaseHTTPRequestHandler):
         # ---- 真接口的假实现 ----
         if p == daily.P_CHECKIN_STATUS:
             return self._reply({"code": 0, "data": {
-                "active": True, "theme_name": "加油站", "today_checked_in": False,
+                "active": True, "theme_name": "加油站",
+                "today_checked_in": CHECKIN["today_checked_in"],
                 "today_credit": 0, "streak_days": 3, "total_credits": 300}})
         if p == daily.P_CHECKIN_CLAIM:
             return self._reply({"code": 0, "data": {"credit": 100}})
@@ -245,8 +248,9 @@ def main() -> int:
                     and daily.P_CHECKIN_CLAIM not in touched, str(sorted(touched)))
         ok &= check("猫还在路上 -> 0 个推送请求", bodies("/push/ren") == [],
                     str(bodies("/push/ren")))
-        ok &= check("无变化时把原因写进 notices",
-                    any("无变化" in n for n in body["json"].get("notices", [])),
+        ok &= check("无变化时把原因写进 notices（并说清是哪一段没事）",
+                    any("没有变化" in n and "猫还在路上" in n
+                        for n in body["json"].get("notices", [])),
                     str(body["json"].get("notices")))
         ok &= check("退出码看猫猫段（路上 = 成功 = 0）",
                     body["rc"] == 0 and body["json"].get("ok") is True,
@@ -290,8 +294,10 @@ def main() -> int:
                     and "--mode" in wf_text and "TRIGGER_CRON:" in wf_text, "")
 
         print("⑨ 延迟自证：GitHub 的 cron 晚多久，要算得出来、说得明白")
-        # 算例就是本次线上事故：计划北京 00:20，实际北京 05:21 才触发
-        rep = daily.cron_report("20 16 * * *", datetime(2026, 10, 8, 21, 21, tzinfo=timezone.utc))
+        # 算例就是本次线上事故：计划北京 00:20，实际北京 05:21 才触发。
+        # cron 现在按 workflow 里声明的 Asia/Shanghai 写（"20 0 * * *" = 北京 00:20），
+        # 脚本必须按同一个时区解释——否则延迟会算成 8 小时以外的假数字。
+        rep = daily.cron_report("20 0 * * *", datetime(2026, 10, 8, 21, 21, tzinfo=timezone.utc))
         ok &= check("算得出计划时刻（北京 00:20）",
                     rep["planned_utc"] == "10-08 16:20" and rep["planned_local"] == "10-09 00:20",
                     json.dumps(rep, ensure_ascii=False))
@@ -302,10 +308,20 @@ def main() -> int:
         ok &= check("延迟说明点明「GitHub 定时器」与两个时刻",
                     "GitHub" in note and "00:20" in note and "05:21" in note
                     and "5 小时 1 分" in note, note)
-        ontime = daily.cron_report("20 16 * * *", datetime(2026, 10, 8, 16, 20, tzinfo=timezone.utc))
+        ontime = daily.cron_report("20 0 * * *", datetime(2026, 10, 8, 16, 20, tzinfo=timezone.utc))
         ok &= check("准点时不产生说明（不打扰人）",
                     ontime["delay_minutes"] == 0 and daily.late_note(ontime) == "",
                     str(ontime["delay_minutes"]))
+        ok &= check("cron 按 workflow 声明的时区解释（不是 UTC）",
+                    rep["timezone"] == "Asia/Shanghai" and rep["plan"] == "all", json.dumps(rep))
+        # 时区没对齐的典型画面：GitHub 忽略了 timezone、按 UTC 触发，
+        # 于是「延迟」正好变成一整个 8 小时。功能全对，只有这个数字在骗人，
+        # 所以要专门认出来（真·GitHub 延迟也可能几小时，但正好卡 8 小时的概率极低）。
+        mismatch = daily.cron_report("20 0 * * *", datetime(2026, 10, 9, 0, 20, tzinfo=timezone.utc))
+        ok &= check("延迟正好偏出一整个 8 小时 -> 提示可能是时区没对齐",
+                    mismatch["delay_minutes"] == 480
+                    and "时区没对齐" in (mismatch.get("warning") or ""),
+                    json.dumps(mismatch, ensure_ascii=False))
         ok &= check("认不出的 cron：报警，且按整轮跑（安全的一边）",
                     "不在已知列表" in (daily.cron_report("30 3 * * 1").get("warning") or "")
                     and daily.cron_report("30 3 * * 1").get("plan") is None, "")
@@ -341,7 +357,7 @@ def main() -> int:
         TRAVEL["state"], TRAVEL["record_id"] = "traveling", None
 
         SEEN.clear()
-        os.environ["TRIGGER_CRON"] = "20 22,4,10 * * *"
+        os.environ["TRIGGER_CRON"] = "20 6,12,18 * * *"
         body = run_cli(["--mode", "auto"])
         touched = {s["path"].split("?")[0] for s in SEEN}
         ok &= check("收猫档的 cron -> segment=cat，且完全不碰签到接口",
@@ -350,7 +366,7 @@ def main() -> int:
                     and daily.P_CHECKIN_CLAIM not in touched, str(sorted(touched)))
 
         SEEN.clear()
-        os.environ["TRIGGER_CRON"] = "20 16 * * *"
+        os.environ["TRIGGER_CRON"] = "20 0 * * *"
         body = run_cli(["--mode", "auto"])
         touched = {s["path"].split("?")[0] for s in SEEN}
         ok &= check("整轮档的 cron -> segment=all，会碰签到接口",
@@ -446,7 +462,105 @@ def main() -> int:
                     folded(blank) == 0 and "\n\n" in blank and "  \n" not in blank, "")
         os.environ.pop("WB_PUSH_NEWLINE", None)
 
+        print("⑬ 只推有变化的：今天已签到 / 已派过猫 / 积分已领过，都不再打扰")
+        # 13.1 判定本身。这里的三种「已完成」正是需求点名的情形，
+        #      再加上收猫轮的「签到段有意跳过」；其余（领到积分、派出新一趟、出错）
+        #      都必须照推。
+        def acct(checkin: str, cat: str, ck_ok: bool = True, ct_ok: bool = True) -> dict:
+            return {"name": "x", "checkin_ok": ck_ok, "cat_ok": ct_ok,
+                    "checkin": {"result": checkin, "lines": []},
+                    "cat": {"result": cat, "lines": []}}
+
+        for label, one in [
+            ("今天已签到 + 今天已派过（额度用完）", acct("ALREADY", "LIMIT")),
+            ("今天已签到 + 猫还在路上", acct("ALREADY", "TRAVELING")),
+            ("今天已签到 + 积分已领过、眼下无待领", acct("ALREADY", "IDLE")),
+            ("收猫轮：签到段有意跳过 + 猫在路上", acct("SKIPPED", "TRAVELING", ck_ok=False)),
+        ]:
+            ok &= check("不推：%s" % label, daily._account_news(one) is False,
+                        json.dumps(one, ensure_ascii=False))
+
+        for label, one in [
+            ("签到领到积分", acct("CLAIMED", "TRAVELING")),
+            ("派出了新的一趟", acct("ALREADY", "DEPARTED")),
+            ("领到旅行积分", acct("ALREADY", "CLAIMED")),
+            ("签到失败", acct("AUTH", "TRAVELING", ck_ok=False)),
+            ("猫猫段失败", acct("ALREADY", "ERROR", ct_ok=False)),
+            ("预算耗尽没跑到（这不是「没事」）",
+             acct("NO_BUDGET", "NO_BUDGET", ck_ok=False, ct_ok=False)),
+            ("没见过的结论一律当有变化（宁可多推，不能漏报）", acct("ALREADY", "WAT")),
+        ]:
+            ok &= check("要推：%s" % label, daily._account_news(one) is True,
+                        json.dumps(one, ensure_ascii=False))
+
+        # 13.2 逐人裁：有自己渠道的人，只有自己有变化才收到自己那一份
+        SEEN.clear()
+        pair = [
+            dict(acct("CLAIMED", "DEPARTED"), name="甲", _notify_problems=[],
+                 _declared_notify=True, _notify={"dingtalk": {"webhook": base + "/push/ding3"}}),
+            dict(acct("ALREADY", "LIMIT"), name="乙", _notify_problems=[],
+                 _declared_notify=True, _notify={"wecom": base + "/push/yi"}),
+        ]
+        n_pair = daily.notify(pair, "2026-01-01 00:00", "test", news_only=True)
+        ok &= check("有变化的人照发、没变化的人完全不打扰",
+                    len(bodies("/push/ding3")) == 1 and bodies("/push/yi") == [],
+                    str([len(bodies("/push/ding3")), len(bodies("/push/yi"))]))
+        ok &= check("没推的人也要在 notices 里留痕（静默必须能自证）",
+                    any("乙" in n and "无变化" in n for n in n_pair), str(n_pair))
+
+        # 13.3 汇总卡片：只列有变化的人，并说清「另外几个没变化」
+        SEEN.clear()
+        os.environ["SERVERCHAN_KEY"] = base + "/push/sct3"
+        os.environ["DINGTALK_WEBHOOK"] = base + "/push/ding3"   # 全局两个渠道，都该收到同一份
+        trio = [dict(acct("CLAIMED", "DEPARTED"), name="甲", _notify={}, _notify_problems=[],
+                     _declared_notify=False),
+                dict(acct("ALREADY", "LIMIT"), name="乙", _notify={}, _notify_problems=[],
+                     _declared_notify=False),
+                dict(acct("ALREADY", "TRAVELING"), name="丙", _notify={}, _notify_problems=[],
+                     _declared_notify=False)]
+        daily.notify(trio, "2026-01-01 00:00", "test", news_only=True)
+        cards = bodies("/push/ding3") + bodies("/push/sct3")
+        # 注意别拿名字本身当判据：末尾那句「另有 2 个账号无变化：乙、丙」里也有名字。
+        # 要看的是**账号区块**在不在（区块标题是加粗的名字）。
+        ok &= check("汇总卡片只列有变化的人（没有乙、丙的账号区块）",
+                    len(cards) == 2 and all("**甲**" in c and "**乙**" not in c
+                                            and "**丙**" not in c for c in cards),
+                    str([c[:120] for c in cards]))
+        ok &= check("卡片末尾说明「另外几个没变化、未列出」（否则名单少了人像跑挂了）",
+                    all("另有 2 个账号本轮无变化" in c for c in cards), str(len(cards)))
+        ok &= check("标题标明「仅报变化」",
+                    all("仅报变化" in c for c in cards), str([c[:60] for c in cards]))
+
+        # 13.4 走完整命令行：整轮里今天已经签过、也已经派过猫 -> 一个推送都不该有
+        CHECKIN["today_checked_in"] = True
+        TRAVEL.update({"state": "idle", "record_id": None, "daily_limit_reached": True})
+        os.environ["WB_ACCOUNTS"] = json.dumps({"accounts": [
+            {"name": "子", "token": "t11", "uid": "u11", "endpoint": base,
+             "notify": {"wecom": base + "/push/zi"}}]}, ensure_ascii=False)
+        SEEN.clear()
+        body = run_cli(["--mode", "all"])
+        wj = body["json"]
+        ok &= check("整轮：今天已签到 + 已派过猫 -> 0 个推送请求",
+                    bodies("/push/zi") == [], str(bodies("/push/zi")))
+        ok &= check("静默时结果里写清「为什么没推」（silent + notices）",
+                    isinstance(wj.get("silent"), dict)
+                    and "没有变化" in " ".join(wj.get("notices") or [])
+                    and bool((wj["silent"].get("details") or {}).get("子")),
+                    json.dumps(wj.get("notices"), ensure_ascii=False))
+        ok &= check("没变化 ≠ 失败：has_news=false，退出码仍是 0",
+                    wj.get("has_news") is False and body["rc"] == 0,
+                    "rc=%s has_news=%s" % (body["rc"], wj.get("has_news")))
+
+        SEEN.clear()
+        body = run_cli(["--mode", "all", "--notify-mode", "always"])
+        ok &= check("--notify-mode always：不看有没有变化，照推",
+                    len(bodies("/push/zi")) == 1, str(len(bodies("/push/zi"))))
+
+        CHECKIN["today_checked_in"] = False
+        TRAVEL.pop("daily_limit_reached", None)
         os.environ.pop("WB_ACCOUNTS", None)
+        os.environ.pop("SERVERCHAN_KEY", None)
+        os.environ.pop("DINGTALK_WEBHOOK", None)
         TRAVEL["state"], TRAVEL["record_id"] = "idle", None
     finally:
         srv.shutdown()

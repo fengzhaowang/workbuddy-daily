@@ -35,8 +35,18 @@
     收猫轮次领完会立刻再派一趟，积分才转得起来；签到一天一次就够，不必重复。
   cron -> 档位 的映射表只有一处（下面 SCHEDULE_MODES），workflow 里不再复制一份，
   test_offline.py 会读 workflow 文件逐条核对，改了 cron 忘了改档位会当场失败。
-  收猫轮次默认只在**有变化时**推送（内置 _has_news 判断），
-  免得「猫还在路上」一天推四遍。要每轮都推就加 --notify-mode always。
+
+推送的另一条规则：**只推「有变化」的**（默认 onchange，逐账号判定）。
+  只报三件真事：签到领到积分、派出了新的一趟、领到旅行积分；以及任何出错。
+  以下情形**不推**——它们都是「今天已经有人做过了」，重复报只会让真正的异常被淹掉：
+    * 今天已经签过（签到段 ALREADY）；
+    * 今天已经派过猫猫、猫还在路上、或今天名额已用完（LIMIT / TRAVELING）；
+    * 已到家的积分已经领过、眼下没有待领的（IDLE，以及领完后回落的 LIMIT）；
+    * 本轮有意跳过的段（收猫轮不跑签到 = SKIPPED）、dry-run。
+  逐人判、逐人裁：有自己渠道的人只在自己有变化时才收到自己那一份；
+  汇总卡片里也只列有变化的人。一轮下来谁都没变化，就整轮静默（日志与结果 JSON 里
+  会写清「为什么没推」，Actions 页面还有本轮摘要，不怕看不出它跑没跑）。
+  想每轮都推（比如自己手动触发时想立刻看到结果）就加 --notify-mode always。
 
 关于「几点触发的」：GitHub 的 schedule 是**尽力而为**——官方文档写明高峰期会延迟
 （整点最挤），实测有晚几分钟到好几小时的。所以脚本会把「计划 / 实际 / 延迟」算出来
@@ -56,7 +66,8 @@
   python3 scripts/daily.py                          # 云端：按触发的 cron 自动定档位
   python3 scripts/daily.py --mode cat               # 只收猫（领积分 + 该派就派）
   python3 scripts/daily.py --cat-only               # 同上，旧写法
-  python3 scripts/daily.py --mode cat --notify-mode always    # 收猫也每轮都推
+  python3 scripts/daily.py --notify-mode always     # 每轮都推，不看有没有变化
+  python3 scripts/daily.py --notify-mode onchange   # 默认：只在有变化时推（逐人裁）
   python3 scripts/daily.py --local                  # 本机单账号
   python3 scripts/daily.py --accounts accounts.local.json   # 本机多账号
   python3 scripts/daily.py --list-accounts          # 只列出识别到的账号（脱敏 + 渠道）
@@ -113,16 +124,31 @@ _BUDGET: float = float(os.environ.get("WB_BUDGET_SECONDS") or BUDGET_BASE_SECOND
 # 逐字一致**，scripts/test_offline.py 会直接读那个文件逐条核对：
 # 改了一处忘了另一处，以前是「看起来正常、就是没积分」的静默错，现在当场失败。
 SCHEDULE_MODES = {
-    "20 16 * * *": "all",            # 北京 00:20        整轮：签到 + 派猫猫
-    "20 22,4,10 * * *": "cat",       # 北京 06/12/18:20  只收猫：领已到家的积分 + 该派就派
+    "20 0 * * *": "all",             # 北京 00:20        整轮：签到 + 派猫猫
+    "20 6,12,18 * * *": "cat",       # 北京 06/12/18:20  只收猫：领已到家的积分 + 该派就派
 }
-CRON_TZ_OFFSET_HOURS = 8             # cron 走 UTC；只用于日志里换算成北京时间给人看
+# cron 的时区。**必须与 workflow 里 schedule 的 timezone 一致**：
+# 2026-03-19 起 GitHub 支持在 cron 旁边写 IANA 时区，workflow 用的是 Asia/Shanghai，
+# 所以上面那几条 cron 是**北京时间**，不是 UTC。算「计划几点、晚了多久」也得按这个时区来，
+# 否则会算出一个 8 小时的假延迟（或者负数）。
+CRON_TIMEZONE = "Asia/Shanghai"
+CRON_TZ_OFFSET_HOURS = 8
+CRON_TZ = timezone(timedelta(hours=CRON_TZ_OFFSET_HOURS))
 LATE_MINUTES = 30                    # 比计划晚这么多分钟，就在结果与推送里说明原因
 
 UNKNOWN_CRON_WARNING = (
     "触发的 cron「%s」不在已知列表里：本轮按整轮（签到+猫猫）跑——安全的那一边。"
     "若你刚在 workflow 里改过 cron，请同步 daily.py 的 SCHEDULE_MODES，"
     "否则收猫那一档会悄悄变成整轮（不会少领积分，但会多跑一段签到、推送也更吵）。")
+
+# 「晚了整整 8 小时」= 时区没对齐的特征。
+# 这类错只会污染「延迟几分钟」这一个数字，功能全对，所以它能长期藏在那里；
+# 而真·GitHub 延迟也要好几个小时，两者只能靠「正好卡一整个 8 小时」来区分。
+TZ_MISMATCH_WARNING = (
+    "本轮延迟 %s 分钟，正好是一个 ±%d 小时的整偏移：这更像是**时区没对齐**"
+    "（daily.yml 里 schedule 的 timezone 与 daily.py 的 CRON_TIMEZONE=%s 不一致），"
+    "而不是真晚了这么久——GitHub 的高峰延迟是几分钟到几小时不等，"
+    "正好卡着一整个 8 小时的概率极低。请核对这两处是不是同一个时区。")
 
 # GitHub 的 schedule 是**尽力而为**：官方文档写明高峰期会延迟（整点最挤），
 # 实测有晚几分钟到好几小时的，甚至整轮被丢弃。所以「几点触发的」不该靠猜，
@@ -151,24 +177,30 @@ def _cron_hm(cron: str) -> Optional[tuple[list[int], list[int]]]:
 
 
 def cron_slot(cron: str, now: Optional[datetime] = None) -> Optional[datetime]:
-    """这条 cron 最近一次「本该触发」的时刻（UTC）；认不出来返回 None。"""
+    """这条 cron 最近一次「本该触发」的时刻（带 CRON_TZ 时区）；认不出来返回 None。
+
+    注意时区：cron 里的 `20 0 * * *` 是**北京时间** 00:20（workflow 里写了
+    `timezone: Asia/Shanghai`），不是 UTC 00:20。这里必须先换算到 CRON_TZ 再比，
+    否则「最近一次计划时刻」会差 8 小时，延迟算出来是假的（甚至负数）。
+    """
     hm = _cron_hm(cron)
     if hm is None:
         return None
     mins, hrs = hm
-    now = now or datetime.now(timezone.utc)
+    now_local = (now or datetime.now(timezone.utc)).astimezone(CRON_TZ)
     for back in (0, 1):                       # 今天找不到就看昨天（跨零点的档）
-        day = (now - timedelta(days=back)).date()
-        due = [datetime(day.year, day.month, day.day, h, m, tzinfo=timezone.utc)
+        day = (now_local - timedelta(days=back)).date()
+        due = [datetime(day.year, day.month, day.day, h, m, tzinfo=CRON_TZ)
                for h in hrs for m in mins
-               if datetime(day.year, day.month, day.day, h, m, tzinfo=timezone.utc) <= now]
+               if datetime(day.year, day.month, day.day, h, m, tzinfo=CRON_TZ) <= now_local]
         if due:
             return max(due)
     return None
 
 
-def _beijing_hhmm(dt: datetime) -> str:
-    return (dt + timedelta(hours=CRON_TZ_OFFSET_HOURS)).strftime("%m-%d %H:%M")
+def _local_hhmm(dt: datetime) -> str:
+    """按 cron 的时区显示时刻——就是收到通知的人手机上那个时间。"""
+    return dt.astimezone(CRON_TZ).strftime("%m-%d %H:%M")
 
 
 def cron_report(trigger: str, now: Optional[datetime] = None) -> dict:
@@ -180,11 +212,11 @@ def cron_report(trigger: str, now: Optional[datetime] = None) -> dict:
     """
     now = now or datetime.now(timezone.utc)
     rep: dict = {
-        "timezone": "UTC",
+        "timezone": CRON_TIMEZONE,
         "triggered_cron": trigger or "",
         "plan": SCHEDULE_MODES.get(trigger or ""),
-        "actual_utc": now.strftime("%m-%d %H:%M"),
-        "actual_local": _beijing_hhmm(now),
+        "actual_utc": now.astimezone(timezone.utc).strftime("%m-%d %H:%M"),
+        "actual_local": _local_hhmm(now),
         "delay_minutes": None,
     }
     if not trigger:
@@ -198,10 +230,13 @@ def cron_report(trigger: str, now: Optional[datetime] = None) -> dict:
         return rep
 
     delay = int((now - slot).total_seconds() // 60)
-    rep.update({"planned_utc": slot.strftime("%m-%d %H:%M"),
-                "planned_local": _beijing_hhmm(slot),
+    rep.update({"planned_utc": slot.astimezone(timezone.utc).strftime("%m-%d %H:%M"),
+                "planned_local": _local_hhmm(slot),
                 "delay_minutes": delay})
-    if rep["plan"] is None:
+    offset = CRON_TZ_OFFSET_HOURS * 60
+    if abs(abs(delay) - offset) <= 2:
+        rep["warning"] = TZ_MISMATCH_WARNING % (delay, CRON_TZ_OFFSET_HOURS, CRON_TIMEZONE)
+    elif rep["plan"] is None:
         rep["warning"] = UNKNOWN_CRON_WARNING % trigger
     return rep
 
@@ -1495,13 +1530,16 @@ def _account_ok(r: dict) -> bool:
     只收猫的轮次签到段恒为 SKIPPED，拿它当门槛等于「必然失败」，
     所以此时看猫猫段；整轮则看签到（猫猫段炸了不影响签到结论，这是需求）。
     """
-    if _seg_result(r, "checkin") == "SKIPPED":
+    if _seg_result(r, "checkin") in _SKIPPED_RESULTS:
         return bool(r.get("cat_ok"))
     return bool(r.get("checkin_ok"))
 
 
 def _is_cat_only(results: list[dict]) -> bool:
-    return bool(results) and all(_seg_result(r, "checkin") == "SKIPPED" for r in results)
+    """这一轮是不是「只收猫」（签到段整段没跑）。预算耗尽被动跳过的也算——
+    它同样没跑签到，总览里不该冒出「签到 0/N」这种吓人的数。"""
+    return bool(results) and all(_seg_result(r, "checkin") in _SKIPPED_RESULTS
+                                 for r in results)
 
 
 def _overview(results: list[dict]) -> str:
@@ -1536,14 +1574,20 @@ def _overview(results: list[dict]) -> str:
     return " · ".join(bits) or "没什么变化"
 
 
-def _push_title(results: list[dict], stamp: str, env: str) -> str:
+def _push_title(results: list[dict], stamp: str, env: str, clipped: bool = False) -> str:
     """通知标题。手机通知栏只给一行，所以按「这份是发给谁看的」来定制：
 
     * 单账号（各人收自己那份）→ 把名字写上去，一眼知道是谁的结果；
     * 多账号（汇总卡片）→ 说清一共几个账号；
-    * 只收猫那几轮 → 标明「收猫」，否则半夜收到一个「日报」会莫名其妙。
+    * 只收猫那几轮 → 标明「收猫」，否则半夜收到一个「日报」会莫名其妙；
+    * clipped（把没变化的账号裁掉后）→ 标明「仅报变化」，
+      否则名单里少了人，收到的人会以为那几个账号跑挂了。
     """
     who = results[0]["name"] if len(results) == 1 else "%d 个账号" % len(results)
+    if clipped:
+        # 裁掉了没变化的人就必须标出来：否则「本来 6 个账号，卡片里只剩 1 个」
+        # 看着像另外 5 个跑挂了。裁完只剩一个人时尤其要标。
+        who += "（仅报变化）"
     kind = "收猫" if _is_cat_only(results) else "日报"
     # stamp 是「2026-10-09 10:49」，标题里只留「10-09 10:49」（完整日期占地方、信息重复）
     short = stamp[5:] if len(stamp) >= 16 else stamp
@@ -1573,41 +1617,110 @@ def _sections_of(results: list[dict], note: str = "") -> list[dict]:
     return secs
 
 
-# 猫猫段的这些结论属于「一切照旧」，没有必须告诉人的信息
-_QUIET_CAT_RESULTS = frozenset({"TRAVELING", "LIMIT", "IDLE", "DRY_RUN", "SKIPPED"})
+# ================= 「这轮有没有值得打扰人的东西」=================
+# 判定的唯一真相：每一段里属于「一切照旧」的结论。**不在表里的一律算有变化**——
+# 认不出来的结论宁可多推一次，也不能悄悄吞掉一个错误（服务端加个新状态字面量时，
+# 我们只会多收到一条消息，不会漏掉一条）。
+_QUIET_RESULTS = {
+    # 今天已经签过 / 活动没开 / dry-run
+    "checkin": frozenset({"ALREADY", "INACTIVE", "DRY_RUN"}),
+    # 今天已派过（猫在路上 / 名额已用完）/ 积分已经领过、眼下没有待领的 / dry-run
+    "cat": frozenset({"TRAVELING", "LIMIT", "IDLE", "DRY_RUN"}),
+}
+
+# 「这一段本轮压根没跑」的结论。它们既不算变化、也不算失败，所以要单独拎出来：
+#   * SKIPPED   —— 有意跳过（收猫轮不跑签到），安静是对的；
+#   * NO_BUDGET —— 时间预算耗尽被动跳过，**必须报**（这是「没跑到」，不是「没事」）。
+# 用同一个 SKIPPED 表示这两种情况曾把这个区别抹掉：预算耗尽会被当成「安静」而静默。
+_SKIPPED_RESULTS = frozenset({"SKIPPED", "NO_BUDGET"})
+
+# 安静结论的人话解释：静默时要说清「为什么没推」，
+# 否则用户只能自己猜「是不是跑挂了」——静默必须能自证。
+_QUIET_WHY = {
+    "checkin": {"ALREADY": "今天已经签过", "INACTIVE": "签到活动没开",
+                "SKIPPED": "本轮不跑签到（只收猫）", "DRY_RUN": "dry-run 没写数据"},
+    "cat": {"TRAVELING": "今天已经派过，猫还在路上",
+            "LIMIT": "今天已经派过（每天一趟），积分也已领过",
+            "IDLE": "眼下没有待领的积分", "SKIPPED": "本轮不跑猫猫",
+            "DRY_RUN": "dry-run 没写数据"},
+}
+_SEG_LABEL = {"checkin": "签到", "cat": "猫猫"}
+
+
+def _seg_news(r: dict, seg: str) -> bool:
+    """这一段有没有值得打扰人的东西。"""
+    res = _seg_result(r, seg)
+    if res == "SKIPPED":
+        return False     # 有意跳过（收猫轮不跑签到）：不算变化，也不算失败
+    if res in _QUIET_RESULTS[seg]:
+        # 结论看着安静，判定却是失败 -> 照样得说（例如「已签过」但接口其实报了错）
+        return not bool(r.get("%s_ok" % seg))
+    return True          # 领到积分 / 派了新一趟 / 出错 / 没见过的结论（含 NO_BUDGET）
+
+
+def _account_news(r: dict) -> bool:
+    """这个账号本轮有没有变化（= 该不该推给他）。"""
+    return any(_seg_news(r, s) for s in _SEG_LABEL)
+
+
+def _account_quiet_why(r: dict) -> list[str]:
+    """没变化时，逐段给出人话原因（日志 / 结果 JSON / Actions 摘要用）。"""
+    out = []
+    for seg, label in _SEG_LABEL.items():
+        res = _seg_result(r, seg)
+        why = _QUIET_WHY.get(seg, {}).get(res) or "没变化（%s）" % (res or "无结论")
+        out.append("%s：%s" % (label, why))
+    return out
 
 
 def _has_news(results: list[dict]) -> bool:
-    """这轮有没有值得打扰人的变化（领到积分 / 派了新的一趟 / 出错）。
+    """这一轮里有没有任何一个账号值得打扰。谁都没有 -> 整轮不推。
 
-    只收猫的轮次一天要跑好几次，「猫还在路上」每次推一遍就是纯噪音，
-    所以那几轮默认只在有变化时才推送（--notify-mode always 可改回每次都推）。
+    一天要跑四轮，而「今天已经签过、已经派过猫、积分也领过了」在后面的轮次里
+    完全是常态：把这种重复的「一切照旧」推出去，只会让真正的异常被淹掉。
     """
-    for r in results:
-        if _seg_result(r, "cat") not in _QUIET_CAT_RESULTS:
-            return True
-        if _seg_result(r, "checkin") != "SKIPPED" and not r.get("checkin_ok"):
-            return True
-    return False
+    return any(_account_news(r) for r in results)
 
 
-def notify(results: list[dict], stamp: str, env: str, note: str = "") -> list[str]:
+def _clipped_note(names: list[str]) -> str:
+    """汇总卡片被裁掉的人，末尾补一句说明。
+
+    单独抽出来是因为 preview_push.py 也要显示同一句——
+    预览和真发必须是同一套文案，否则「预览看着好好的、发出去不一样」。
+    """
+    return ("另有 %d 个账号本轮无变化（已签到 / 今日已派过猫 / 积分已领过），未列出：%s"
+            % (len(names), "、".join(names)))
+
+
+def notify(results: list[dict], stamp: str, env: str, note: str = "",
+           news_only: bool = False) -> list[str]:
     """推送。逐人分层，互不牵连：
 
     * 声明了自己的渠道（`notify`）的账号：**只**发给他自己那几个渠道，
       不混进汇总卡片，也不受全局 NOTIFY_CHANNELS 影响；
     * 其余账号：汇总成一份，发到全局渠道（detect_channels）。
 
+    news_only=True（默认的 onchange 语义）时**逐人裁掉没变化的**：
+    今天已经签过、已经派过猫、积分也领过的人，这一轮不该再被打扰一次。
+    有变化的人照发；汇总卡片里也只列有变化的人，被裁掉的在末尾说明一行。
+
     note 非空时附在正文末尾（例如「本轮是 GitHub 定时器延迟触发的」）。
     单个渠道失败只写进 notices，不影响退出码，也不影响别的渠道。
     """
     notices: list[str] = []
     shared: list[dict] = []
+    skipped: list[str] = []            # 因为「没变化」而没推的账号名
 
     # ① 各人发自己的（标题带上他自己的名字，通知栏一眼能认出是谁的结果）
     for r in results:
         for p in (r.get("_notify_problems") or []):
             notices.append("%s（通知）：%s" % (r["name"], p))
+        if news_only and not _account_news(r):
+            # 没变化：不打扰他，但要在 notices 里留下痕迹——静默必须能自证
+            skipped.append(r["name"])
+            notices.append("%s：本轮无变化（%s），不推送"
+                           % (r["name"], "；".join(_account_quiet_why(r))))
+            continue
         resolved = r.get("_notify") or {}
         if not resolved:
             # 没声明过渠道 -> 并入汇总；
@@ -1634,12 +1747,61 @@ def notify(results: list[dict], stamp: str, env: str, note: str = "") -> list[st
                 "详见 README「通知渠道」一节）" % (who, len(shared)))
         else:
             secs = _sections_of(shared, note)
+            if skipped:
+                # 裁了人就得说：否则名单里少了谁，收到的人会以为那几个账号跑挂了
+                secs.append({"note": _clipped_note(skipped)})
             ok = all(_account_ok(r) for r in shared)
-            title = _push_title(shared, stamp, env)
+            title = _push_title(shared, stamp, env, clipped=bool(skipped))
             for ch in channels:
                 notices.append(_dispatch(ch, _env_cfg(ch), stamp, env, title, secs, ok))
 
     return notices
+
+
+def write_step_summary(body: dict, results: list[dict]) -> None:
+    """把本轮结论写进 Actions 页面的 Job Summary（不在 Actions 里跑就跳过）。
+
+    为什么需要它：默认「没变化就不推送」。真一整天没收到消息时，得有个地方
+    能立刻确认「它跑了，而且确实没变化」——否则「安静」和「跑挂了」在人眼里长得一样。
+    Actions 页面上的这一页摘要就是那个地方，它不打扰任何人。
+    """
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    rep = body.get("cron") or {}
+    summ = body.get("summary") or {}
+    seg = "只收猫（领积分 + 该派就派）" if body.get("segment") == "cat" else "整轮（签到 + 猫猫）"
+
+    out = ["## Buddy 加油站 · %s" % seg, ""]
+    out.append("- 跑的时间：%s（北京）" % (rep.get("actual_local") or "-"))
+    if rep.get("triggered_cron"):
+        out.append("- 触发：cron `%s` · 计划 %s（北京） · 实际晚了 %s 分钟"
+                   % (rep["triggered_cron"], rep.get("planned_local") or "-",
+                      rep.get("delay_minutes")))
+    else:
+        out.append("- 触发：手动（workflow_dispatch）")
+    out.append("- 结果：%d 个账号，%s" % (
+        summ.get("total", len(results)),
+        "全部成功" if body.get("ok") else "有失败：%s" % "、".join(summ.get("failed") or [])))
+    if body.get("silent"):
+        out.append("- 推送：**跳过**（本轮没有变化，理由见下表「变化」列）")
+    else:
+        out.append("- 推送：%s" % "；".join(body.get("notices") or [])[:500])
+
+    out += ["", "| 账号 | 签到 | 猫猫 | 变化 |", "| --- | --- | --- | --- |"]
+    for r in results:
+        why = "、".join(_account_quiet_why(r)) if not _account_news(r) else "有变化 → 已推送"
+        out.append("| %s | %s | %s | %s |" % (
+            r["name"], _seg_result(r, "checkin") or "-", _seg_result(r, "cat") or "-", why))
+    for w in body.get("warnings") or []:
+        out.append("\n> ⚠️ %s" % w)
+    out.append("")
+
+    try:
+        with open(path, "a", encoding="utf-8") as fp:
+            fp.write("\n".join(out) + "\n")
+    except OSError as e:      # 摘要只是给人看的，写不进去不该影响任务本身
+        print("[summary] 写 Actions 摘要失败：%s" % e, file=sys.stderr)
 
 
 # ================= 主流程 =================
@@ -1660,8 +1822,9 @@ def main() -> int:
     ap.add_argument("--cat-only", action="store_true",
                     help="等价于 --mode cat：只收猫（领已到家的积分 + 该派就派新的一趟），跳过签到")
     ap.add_argument("--notify-mode", choices=("auto", "always", "onchange"), default="auto",
-                    help="auto（默认）：整轮跑总是推送，--cat-only 时只在有变化时推送；"
-                         "always 每轮都推；onchange 只在有变化时推")
+                    help="auto / onchange（都是默认）：只在有变化时推送，并逐人裁掉"
+                         "「今天已签到 / 已派过猫 / 积分已领过」的人；"
+                         "always：每轮都推，不看有没有变化")
     ap.add_argument("--allow-partial", action="store_true",
                     help="只要有任意一个账号签到成功就返回 0（默认要求全部成功）")
     args = ap.parse_args()
@@ -1682,12 +1845,14 @@ def main() -> int:
     print("[cron] %s；本轮模式=%s" % (cron_line(cron_rep), "只收猫" if cat_only else "整轮"),
           file=sys.stderr)
 
-    # 推送频率：默认「整轮跑每轮都推，只收猫的轮次只在有变化时推」。
-    # 收猫轮一天跑好几次，把「猫还在路上」也推一遍就是纯噪音。
+    # 推送频率：默认**只在有变化时推**，而且逐人判、逐人裁。
+    # 一天跑四轮，「今天已经签过、已经派过猫、积分也领过了」在后面几轮里是常态，
+    # 把这句重复的「一切照旧」推四遍，只会让真正的异常被淹掉。
+    # 要每轮都推（比如手动触发时想立刻看到结果）就用 --notify-mode always。
     notify_mode = (args.notify_mode if args.notify_mode != "auto"
                    else (os.environ.get("WB_NOTIFY_MODE") or "").strip().lower())
     if notify_mode not in ("always", "onchange"):
-        notify_mode = "onchange" if cat_only else "always"
+        notify_mode = "onchange"
 
     try:
         accounts = _load_accounts(args)
@@ -1743,9 +1908,11 @@ def main() -> int:
             resolved, problems = account_channels(a)
             results.append({
                 "name": a.name, "uid": redact(a.uid), "checkin_ok": False, "cat_ok": False,
-                "checkin": {"ok": False, "segment": "签到", "result": "SKIPPED",
+                # 用 NO_BUDGET 而不是 SKIPPED：这不是「有意跳过」，是「没跑到」，
+                # 必须推出去让人看见（SKIPPED 会被当成安静而静默掉）。
+                "checkin": {"ok": False, "segment": "签到", "result": "NO_BUDGET",
                             "lines": ["⏱ 时间预算已耗尽，本账号本轮跳过（下轮会自动补上）"]},
-                "cat": {"ok": False, "segment": "猫猫旅行", "result": "SKIPPED",
+                "cat": {"ok": False, "segment": "猫猫旅行", "result": "NO_BUDGET",
                         "lines": ["⏱ 时间预算已耗尽，本段跳过"]},
                 "_trace": [], "_notify": resolved, "_notify_problems": problems,
                 "_declared_notify": bool(a.notify)})
@@ -1793,14 +1960,28 @@ def main() -> int:
     for w in cron_warnings:
         print("  ⚠️ %s" % w, file=sys.stderr)
 
+    news = _has_news(results)
+    body["has_news"] = news
+    body["notify_mode"] = notify_mode
+
     if args.no_notify:
         body["notices"] = ["(--no-notify：已跳过推送)"]
-    elif notify_mode == "onchange" and not _has_news(results):
-        # 一天要跑好几轮，没变化就不打扰；真出错 / 领到积分 / 派了新一趟都会走下面
-        body["notices"] = ["（本轮无变化：猫猫还在路上或今日名额已用完，未推送以免打扰）"]
+    elif notify_mode == "onchange" and not news:
+        # 谁都没变化：整轮静默。但必须留下自证的痕迹——
+        # 「安静」和「跑挂了」在人眼里长得一样，不写清楚就只能靠人猜。
+        body["silent"] = {
+            "reason": "本轮所有账号都没有变化（今天已签到 / 已派过猫猫 / 积分已领过）",
+            "details": {r["name"]: _account_quiet_why(r) for r in results},
+        }
+        detail = "；".join("%s（%s）" % (r["name"], "、".join(_account_quiet_why(r)))
+                           for r in results)
+        body["notices"] = ["⏸ 本轮没有变化，未推送以免打扰 —— %s" % detail]
+        print("[notify] 本轮无变化，跳过推送：%s" % detail, file=sys.stderr)
     else:
-        # 延迟说明附进推送正文：收到 5 点的通知时，正文里就能看到为什么
-        body["notices"] = notify(results, stamp, env_name, note=late)
+        # 延迟说明附进推送正文：收到 5 点的通知时，正文里就能看到为什么。
+        # news_only：逐人裁掉没变化的（他今天已经做过的事，不必再报一遍）。
+        body["notices"] = notify(results, stamp, env_name, note=late,
+                                 news_only=(notify_mode == "onchange"))
 
     # 「配置被静默忽略」是最难自查的一类问题：放到最显眼的两处，别让人去翻日志
     if unknown_warnings:
@@ -1810,6 +1991,7 @@ def main() -> int:
         body["warnings"] = cron_warnings + body.get("warnings", [])
         body["notices"] = cron_warnings + body["notices"]
 
+    write_step_summary(body, results)      # Actions 页面上留一页摘要（不在 Actions 里跑就跳过）
     print(json.dumps(body, ensure_ascii=False, indent=2))
 
     # 需求 4：签到成功就算成功，猫猫失败不改退出码

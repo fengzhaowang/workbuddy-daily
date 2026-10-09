@@ -6,7 +6,7 @@
 肉眼看不见，所以这里统一显示成 `··`——真实内容里就是「两个空格 + 换行」。
 
 用法：
-  python3 scripts/preview_push.py                    # 四个账号的整轮（默认）
+  python3 scripts/preview_push.py                    # 五个账号的整轮（默认，含一个「都没变化」的）
   python3 scripts/preview_push.py --single            # 单账号（各人收自己那份的样子）
   python3 scripts/preview_push.py --cat-only          # 只收猫那一档（签到段不显示）
   python3 scripts/preview_push.py --newline blank     # 换行风格：space(默认)/blank/lf
@@ -46,7 +46,8 @@ def _cat(result: str, ok: bool, lines: list[str], **extra) -> dict:
 
 
 def samples() -> list[dict]:
-    """四种典型形态各来一个：已签 / 新签 / token 失效 / 猫在路上。"""
+    """五种典型形态各来一个（第 5 个是「一切都已完成」的安静形态，
+    用来演示默认策略会把他整个裁掉）：已签 / 新签 / token 失效 / 猫在路上 / 都没变化。"""
     return [
         _acc("冯召旺",
              _ck("ALREADY", True, ["✅ 今天已经签过了（今日 100 · 连续 3 天 · 累计 300）"],
@@ -67,6 +68,13 @@ def samples() -> list[dict]:
         _acc("于得水",
              _ck("AUTH", False, ["❌ 登录态失效（HTTP 401）：该账号的 token 已过期，需在本机重新导出"]),
              _cat("AUTH", False, ["⚠️ 登录态失效（HTTP 401），本段跳过"])),
+        # 今天的活儿全都干完了：签到了、派人过了、积分也领了。
+        # 默认策略下这个账号**整段都不会出现**（见下面的 ⑤）。
+        _acc("安静君",
+             _ck("ALREADY", True, ["✅ 今天已经签过了（今日 0 · 连续 4 天 · 累计 300）"],
+                 today_credit=0),
+             _cat("LIMIT", True, ["猫咪 布丁喵（R）", "🛑 今天已经派过了（每天一趟）"],
+                  buddy="布丁喵（R）")),
     ]
 
 
@@ -161,9 +169,31 @@ def main() -> int:
         print(_visible(body, True))
         print()
 
+    print("=" * 68)
+    print("⑤ 默认策略：只推有变化的（逐人裁）")
+    print("   今天已签到 / 已派过猫 / 积分已领过 -> 不推；领到、派出、出错 -> 推")
+    print("=" * 68)
+    for r in results:
+        print("  %-8s %s" % (r["name"], "有变化 → 推" if daily._account_news(r)
+                             else "无变化 → 不推（%s）" % "、".join(daily._account_quiet_why(r))))
+    kept = [r for r in results if daily._account_news(r)]
+    print()
+    if not kept:
+        print("  谁都没变化 -> 整轮静默（日志里会写：")
+        print("    [notify] 本轮无变化，跳过推送：某某（签到：今天已经签过、猫猫：…）")
+    else:
+        dropped = [r["name"] for r in results if not daily._account_news(r)]
+        print("  标题：" + daily._push_title(kept, stamp, "prod", clipped=bool(dropped)))
+        print()
+        secs_kept = daily._sections_of(kept, note)
+        if dropped:
+            secs_kept.append({"note": daily._clipped_note(dropped)})
+        print(_visible(daily._fmt_sections(secs_kept), show))
+    print()
+
     if args.json:
         print("=" * 68)
-        print("⑤ 结果 JSON 结构（`daily.py` 打到 Actions 日志里的形状）")
+        print("⑥ 结果 JSON 结构（`daily.py` 打到 Actions 日志里的形状）")
         print("=" * 68)
         body = {"ok": all(daily._account_ok(r) for r in results), "timestamp": stamp,
                 "env": "prod", "segment": "cat" if args.cat_only else "all",
