@@ -245,19 +245,19 @@ python3 scripts/export_token.py --import 同事给的.json
 
 ```bash
 # 先看这个人在发给谁
-python3 scripts/export_token.py --notify "李灏然"
+python3 scripts/export_token.py --notify "张三"
 
 # 只选渠道（借全局凭据）
-python3 scripts/export_token.py --notify "李灏然" --use dingtalk
+python3 scripts/export_token.py --notify "张三" --use dingtalk
 
 # 带上他自己的凭据（一个渠道一条 --use，可写多次）
-python3 scripts/export_token.py --notify "李灏然" --use 'serverchan:key=SCTxxxxx'
-python3 scripts/export_token.py --notify "李灏然" \
+python3 scripts/export_token.py --notify "张三" --use 'serverchan:key=SCTxxxxx'
+python3 scripts/export_token.py --notify "张三" \
     --use 'wecom:webhook=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx' \
     --use 'email:host=smtp.qq.com,user=me@qq.com,pass=授权码,to=me@qq.com'
 
 # 改回「并进汇总卡片」
-python3 scripts/export_token.py --notify "李灏然" --clear-notify
+python3 scripts/export_token.py --notify "张三" --clear-notify
 
 # 忘了某个渠道要哪些字段？先看这张表
 python3 scripts/export_token.py --channels
@@ -329,9 +329,9 @@ python3 scripts/test_notify.py --plan                              # 或直接�
 ## 推送长什么样
 
 ```
-⚠️ 有问题：于得水 · ✅ 签到 3/4 · 🎁 收 1 趟积分 · 🚀 派出 1 趟 · 🐱 1 只在路上
+⚠️ 有问题：XXX · ✅ 签到 3/4 · 🎁 收 1 趟积分 · 🚀 派出 1 趟 · 🐱 1 只在路上
 
-**1. 冯召旺**
+**1. XXX**
 
 🏠 **签到**
 ✅ 今天已经签过了（今日 100 · 连续 3 天 · 累计 300）
@@ -341,7 +341,7 @@ python3 scripts/test_notify.py --plan                              # 或直接�
 🎁 领到旅行积分 +6
 🛑 今天已经派过了（每天一趟）
 
-**2. 李灏然**
+**2. XXX**
 
 🏠 **签到**
 ✅ 签到成功 +6 积分（今日 6 · 连续 1 天 · 累计 6）
