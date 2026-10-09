@@ -13,10 +13,7 @@ name: Buddy 加油站每日任务
 # 晚超过 LATE_MINUTES（30 分钟）还会在通知正文里说明，不用对着凌晨 5 点的通知发懵。
 on:
   schedule:
-    - cron: "20 0 * * *"          # ① 整轮
-      timezone: 'Asia/Shanghai' # 注意这里
-    - cron: "20 6,12,18 * * *"     # ② 只收猫（北京 6/12/18 点）
-      timezone: 'Asia/Shanghai' # 注意这里
+    - cron: "20 */3 * * *"          # ① 整轮
   # 也可以到 Actions 页面手动点一次，并顺手指定只跑哪一段、要不要照推
   workflow_dispatch:
     inputs:
