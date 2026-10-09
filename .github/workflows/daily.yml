@@ -30,7 +30,7 @@ on:
       notify:
         description: "推送策略"
         type: choice
-        default: always
+        default: onchange
         options:
           - always    # 不看有没有变化，都推（手动点一次通常就是想立刻看到结果）
           - onchange  # 只在有变化时推（定时任务的默认行为）
